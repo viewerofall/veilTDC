@@ -1,5 +1,5 @@
 # VeilTDC
-**⚠️ VeilTDC is currently a placeholder repo and there is nothing happening currently with progress on it, development starts April 9th.⚠️** 
+**⚠️ VeilTDC is currently a proof of concept, current rendering only works for terminal apps barely. Genuine development begins on April 9th⚠️** 
 
 **TDC — Terminal Display Compositor**
 
