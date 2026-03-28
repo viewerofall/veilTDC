@@ -1,0 +1,16 @@
+[package]
+name    = "veil-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "veil"
+path = "src/main.rs"
+
+[dependencies]
+clap            = { workspace = true }
+crossterm       = { workspace = true }
+ctrlc           = { workspace = true }
+veil-compositor = { path = "../veil-compositor" }
+veil-render     = { path = "../veil-render" }
+veil-config     = { path = "../veil-config" }

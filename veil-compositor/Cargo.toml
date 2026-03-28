@@ -1,0 +1,11 @@
+[package]
+name    = "veil-compositor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+veil-render  = { path = "../veil-render" }
+portable-pty = { workspace = true }
+vt100        = { workspace = true }
+image        = { workspace = true }
+serde_json   = "1"
