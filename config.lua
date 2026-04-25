@@ -1,2 +1,2 @@
-quality = "ascii_luma"
+quality = "kitty"
 fps     = 30

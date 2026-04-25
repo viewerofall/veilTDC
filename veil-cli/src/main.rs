@@ -28,7 +28,7 @@ struct Cli {
 enum Command {
     /// Run a TUI/terminal app. Ctrl+C exits.
     Run { app: String },
-    /// Run a GUI app (uses grim + hyprctl for frame capture). Ctrl+C exits.
+    /// Run a GUI app (captures with grim + Niri IPC). Ctrl+C exits.
     RunGui { app: String },
     /// Show terminal capabilities and active config
     Probe,
@@ -105,7 +105,7 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     // The render loop just re-displays whatever the background thread last captured.
     let capture_fps = (cfg.fps / 2).max(5);
 
-    let compositor = GuiCompositor::launch(
+    let mut compositor = GuiCompositor::launch(
         &app, cols, rows,
         Duration::from_secs(8),
         capture_fps,
@@ -130,17 +130,9 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
 
     let budget = Duration::from_secs_f64(1.0 / cfg.fps.max(1) as f64);
     let mut stdout = io::stdout();
-    terminal::enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, cursor::Hide)?;
+    let _ = terminal::enable_raw_mode();
+    let _ = execute!(stdout, EnterAlternateScreen, cursor::Hide);
 
-    // Hysteresis threshold: a cell must shift by this many luma units before
-    // its character changes. Absorbs compositor noise (Hyprland blur, shadows,
-    // subpixel AA) without blinding us to real content changes.
-    // With 70 chars each bin is ~3.6 units — threshold of 18 ≈ 5 bins of
-    // change required, which real UI transitions easily clear.
-    // Threshold: cell must shift this many luma units to flip character.
-    // Absorbs Hyprland compositor noise (~2–8 units) while passing real
-    // UI transitions (30–100 units) cleanly.
     const HYSTERESIS: u8 = 18;
 
     let cell_count    = cols as usize * rows as usize;
@@ -150,6 +142,9 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     let result = dirty_loop(
         &alive, cols, rows, budget, &mut stdout,
         || {
+            if !compositor.is_running() {
+                alive.store(false, Ordering::SeqCst);
+            }
             let raw = compositor.capture_luma();
             if first {
                 stable = raw;
@@ -157,9 +152,7 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
             } else {
                 apply_hysteresis(&mut stable, &raw, HYSTERESIS);
             }
-            // Edge detection: compares neighbouring cell lumas to find UI borders
             let mut chars = luma_to_chars(&stable, cols, rows);
-            // AT-SPI overlay: stamps actual widget text over the luma/edge render
             let text = compositor.capture_text();
             apply_text_overlay(&mut chars, &text, cols);
             chars

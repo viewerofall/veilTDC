@@ -1,1 +1,31 @@
-*.lock
+# Rust/Cargo
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Temp files
+*.swp
+*.swo
+*~
+.DS_Store
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.vim/
+
+# Build outputs
+*.zig.o
+/veil-capture/libveil_capture.so
+/veil-capture/build-output/

@@ -1,53 +1,72 @@
-# VeilTDC
-**⚠️ VeilTDC is currently a proof of concept, current rendering only works for terminal apps barely. Genuine development begins on April 9th⚠️** 
+# veil
 
-**TDC — Terminal Display Compositor**
+**Terminal GUI renderer** — capture and encode GUI applications to ASCII art.
 
-A Wayland compositor that runs inside your terminal. Veil hosts graphical applications and encodes their framebuffers directly to terminal output, letting you run a full desktop environment over SSH, in tmux, or anywhere a terminal works.
+> [!IMPORTANT]
+> **AI-Assisted Project:** This repository was developed with the help of AI. Whilst I have tried to review the code, I can not guarantee the code to be efficent. **Use caution**
 
 ## What is it?
 
-Veil is a **Terminal Display Compositor (TDC)** — it manages Wayland and X11 windows like any other compositor, but instead of rendering to a GPU framebuffer, it encodes frames to your terminal using a quality ladder:
+Veil renders graphical applications inside your terminal by:
+1. Launching GUI apps under Niri (Wayland compositor)
+2. Capturing frames with `grim`
+3. Converting to luma-based ASCII art with edge detection
+4. Overlaying actual text from accessibility APIs (AT-SPI)
 
-1. **Kitty Graphics Protocol** (best quality)
-2. **Sixel** (wide compatibility)
-3. **ASCII edge detection** (fast, stylized)
-4. **ASCII luminance** (universal fallback)
-
-## Features
-
-- **Full Wayland/X11 support** — runs native graphical applications via Smithay and XWayland
-- **Quality ladder** — auto-detects terminal capabilities and system performance
-- **TTY boot** — launches directly from a TTY using libseat and DRM
-- **Adaptive performance** — CPU speed and core count determine encoding tier
-- **Manual overrides** — `--override quality=X,fps=N` for fine control
-- **Minimal footprint** — targets i686 and Raspberry Pi Zero 2W as baseline hardware
+Currently optimized for Niri on Linux. Works with any GTK/Qt app.
 
 ## Architecture
 
-- **veil-compositor** — Smithay-based Wayland compositor with XWayland integration
-- **veil-render** — Zig encoding engine (quality ladder, dirty-rect tracking, frame budgeting)
-- **veil-config** — Configuration layer
-- **veil-cli** — Command-line interface
+- **veil-cli** — TUI interface for launching and rendering apps
+- **veil-compositor** — Window detection, frame capture pipeline
+  - Niri IPC for window discovery
+  - grim fullscreen capture
+  - Luma computation + hysteresis for character selection
+  - AT-SPI text overlay from accessibility tree
+- **veil-render** — Character encoding (ASCII luma, edge detection, dirty-row optimization)
+- **veil-config** — Lua configuration layer
+- **veil-capture** — Zig library for future LD_PRELOAD GPU capture (wl_shm interception, EGL hooks)
 
-## Project Status
+## Status
 
-Early development. A working skeleton that runs terminal applications exists. Current focus is beta (mid-May) and v1 (mid-June) releases.
+**April 2026**: Basic rendering working. GUI apps (nautilus, zen-browser) render as ASCII. Fullscreen capture includes desktop background (known limitation of Niri coordinate system).
 
-## Distribution Plan
+**Next**: GPU rendering path (May 1st start). Proper window region capture via Wayland screencopy protocol or calculated tile positions. Smithay rewrite for full compositor.
 
-- **v1**: AUR packages, curl installer, AppImage, GitHub releases
-- **v1.x**: apt PPA, Flathub (nested only), RPM COPR
-- **v2**: Windows (WSL2 via winget), macOS (Lima VM via Homebrew)
+## Usage
 
-## Use Cases
+```bash
+# Terminal app
+veil run my-tui-app
 
-- Remote desktop over SSH
-- Running graphical apps in tmux/screen sessions
-- Headless server GUI access
-- Low-bandwidth remote workflows
-- Retro computing aesthetics
+# GUI app (renders to terminal)
+veil run-gui nautilus
+veil run-gui zen-browser
+
+# Press Ctrl+C to exit
+```
+
+Override FPS or quality:
+```bash
+veil run-gui --override fps=15 zen-browser
+```
+
+## Limitations
+
+- Requires Niri compositor (uses `niri msg --json windows` for window detection)
+- Fullscreen capture only (shows desktop background behind app)
+- No window positioning — app fills terminal view
+- CPU-bound luma computation (GPU path in progress)
+
+## Build
+
+```bash
+cargo build --release
+./target/release/veil run-gui nautilus
+```
+
+Requires: `grim` (Wayland screenshot), `python3` (AT-SPI), `niri` (compositor)
 
 ---
 
-**veilTDC** — because sometimes the terminal is all you need.
+**veil** — your apps, your terminal.
