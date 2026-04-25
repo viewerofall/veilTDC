@@ -5,6 +5,9 @@
 > [!IMPORTANT]
 > **AI-Assisted Project:** This repository was developed with the help of AI. Whilst I have tried to review the code, I can not guarantee the code to be efficent. **Use caution**
 
+## Warnings & usage
+Currently right now, veil isnt built to get used. There are major issues, like frame rendering in cli apps causing your screen to look like a crt, not being able to actually send any mouse and keyboard inputs to it, and actual gui windows just not working. It also is only supported on niri currently but am working to expand that with a modular registry design to swap out components with what you are on from a TTY to a sway compositor. Currently everything needs to be rendered under a config.lua in a /home/abyss/veil (local place) but well I doubt you have that. This isnt meant for use yet. Wait.
+
 ## What is it?
 
 Veil renders graphical applications inside your terminal by:
