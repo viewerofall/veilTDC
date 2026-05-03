@@ -8,5 +8,8 @@ veil-render  = { path = "../veil-render" }
 portable-pty = { workspace = true }
 vt100        = { workspace = true }
 image        = { workspace = true }
-serde_json   = "1"
-libc         = "0.2"
+serde_json            = "1"
+libc                  = "0.2"
+wayland-client        = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+rustix                = { workspace = true }

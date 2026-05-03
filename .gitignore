@@ -27,5 +27,10 @@ Cargo.lock
 
 # Build outputs
 *.zig.o
+/libveil_capture.so
 /veil-capture/libveil_capture.so
 /veil-capture/build-output/
+/veil-capture/.zig-cache/
+/veil-capture/zig-out/
+/veil-screencopy/veil-screencopy
+/veil-screencopy/gen/
