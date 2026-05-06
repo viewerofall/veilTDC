@@ -218,6 +218,10 @@ impl WaylandCapture {
         Some(Self { conn, eq, state, qh })
     }
 
+    pub fn output_scale(&self) -> i32 {
+        self.state.output_scale.max(1)
+    }
+
     /// Capture a logical-coordinate region of the primary output.
     ///
     /// `x`, `y`, `w`, `h` are in compositor logical pixels (Niri IPC units).

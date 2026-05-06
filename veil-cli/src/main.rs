@@ -9,7 +9,7 @@ use std::{
 };
 use veil_compositor::{GuiCompositor, TermCompositor};
 use veil_config::load as load_config;
-use veil_render::{apply_hysteresis, apply_text_overlay, luma_to_chars, render_chars};
+use veil_render::{render_chars, rgba_to_halfblocks, ColorCell};
 
 #[derive(Parser)]
 #[command(name = "veil", about = "Terminal display compositor — any app, any terminal")]
@@ -100,10 +100,7 @@ fn run_tui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
 
 fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-
-    // Capture at half the render FPS — grim is slow, decoupling prevents breathing.
-    // The render loop just re-displays whatever the background thread last captured.
-    let capture_fps = (cfg.fps / 2).max(5);
+    let capture_fps  = (cfg.fps / 2).max(5);
 
     let mut compositor = GuiCompositor::launch(
         &app, cols, rows,
@@ -118,7 +115,7 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
         let mut buf = [0u8; 64];
         loop {
             match stdin.lock().read(&mut buf) {
-                Ok(0) | Err(_)                          => break,
+                Ok(0) | Err(_)                        => break,
                 Ok(n) if buf[..n].contains(&0x03) => {
                     alive_ks.store(false, Ordering::SeqCst);
                     break;
@@ -133,35 +130,69 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     let _ = terminal::enable_raw_mode();
     let _ = execute!(stdout, EnterAlternateScreen, cursor::Hide);
 
-    const HYSTERESIS: u8 = 18;
-
-    let cell_count    = cols as usize * rows as usize;
-    let mut stable    = vec![0u8; cell_count];
-    let mut first     = true;
-
-    let result = dirty_loop(
+    let result = color_dirty_loop(
         &alive, cols, rows, budget, &mut stdout,
         || {
             if !compositor.is_running() {
                 alive.store(false, Ordering::SeqCst);
             }
-            let raw = compositor.capture_luma();
-            if first {
-                stable = raw;
-                first  = false;
-            } else {
-                apply_hysteresis(&mut stable, &raw, HYSTERESIS);
+            let (w, h, rgba) = compositor.capture_rgba();
+            if w == 0 || h == 0 || rgba.is_empty() {
+                return vec![ColorCell { fg: [0, 0, 0], bg: [0, 0, 0] }; cols as usize * rows as usize];
             }
-            let mut chars = luma_to_chars(&stable, cols, rows);
-            let text = compositor.capture_text();
-            apply_text_overlay(&mut chars, &text, cols);
-            chars
+            rgba_to_halfblocks(&rgba, w, h, cols, rows)
         },
     );
 
     let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
     result
+}
+
+// ── Colour render loop ────────────────────────────────────────────────────────
+
+fn color_dirty_loop(
+    alive: &AtomicBool,
+    cols: u16,
+    rows: u16,
+    budget: Duration,
+    stdout: &mut io::Stdout,
+    mut capture: impl FnMut() -> Vec<ColorCell>,
+) -> io::Result<()> {
+    let black = ColorCell { fg: [0, 0, 0], bg: [0, 0, 0] };
+    let mut prev = vec![black; cols as usize * rows as usize];
+
+    while alive.load(Ordering::SeqCst) {
+        let tick = Instant::now();
+        let curr = capture();
+
+        for row in 0..rows {
+            let s = row as usize * cols as usize;
+            let e = (s + cols as usize).min(curr.len());
+            if e <= s || curr[s..e] == prev[s..e] { continue; }
+
+            execute!(stdout, cursor::MoveTo(0, row))?;
+            let mut line = String::with_capacity(cols as usize * 32);
+            for cell in &curr[s..e] {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    line,
+                    "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u{2580}",
+                    cell.fg[0], cell.fg[1], cell.fg[2],
+                    cell.bg[0], cell.bg[1], cell.bg[2],
+                );
+            }
+            line.push_str("\x1b[0m");
+            write!(stdout, "{line}")?;
+        }
+        stdout.flush()?;
+        prev = curr;
+
+        if let Some(rem) = budget.checked_sub(tick.elapsed()) {
+            thread::sleep(rem);
+        }
+    }
+    Ok(())
 }
 
 // ── Shared render loop ────────────────────────────────────────────────────────

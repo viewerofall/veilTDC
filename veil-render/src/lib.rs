@@ -1,5 +1,43 @@
 use image::{imageops, DynamicImage, RgbaImage};
 
+/* ── Half-block colour renderer ──────────────────────────────────────────── */
+
+/// One terminal cell in half-block colour mode.
+/// `▀` is always the character; fg = top pixel, bg = bottom pixel.
+#[derive(Clone, PartialEq)]
+pub struct ColorCell {
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+}
+
+fn sample_rgb(rgba: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
+    let off = (y * width + x) as usize * 4;
+    if off + 2 < rgba.len() { [rgba[off], rgba[off + 1], rgba[off + 2]] }
+    else { [0, 0, 0] }
+}
+
+/// Convert an RGBA frame to half-block `ColorCell` grid.
+///
+/// Each terminal row maps to two source pixel rows via `▀` (top=fg, bot=bg),
+/// doubling effective vertical resolution. Nearest-neighbour sampling.
+pub fn rgba_to_halfblocks(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> Vec<ColorCell> {
+    let eff_h = rows as u32 * 2;
+    let eff_w = cols as u32;
+    let mut cells = Vec::with_capacity(cols as usize * rows as usize);
+    for row in 0..rows as u32 {
+        for col in 0..eff_w {
+            let px_x  = col           * src_w / eff_w;
+            let top_y = (row * 2)     * src_h / eff_h;
+            let bot_y = (row * 2 + 1) * src_h / eff_h;
+            cells.push(ColorCell {
+                fg: sample_rgb(rgba, src_w, px_x, top_y),
+                bg: sample_rgb(rgba, src_w, px_x, bot_y),
+            });
+        }
+    }
+    cells
+}
+
 const LUMA_MAP: &[char] = &[
     ' ', '.', '\'', '`', '^', '"', ',', ':', ';', 'I', 'l', '!', 'i',
     '>', '<', '~', '+', '_', '-', '?', ']', '[', '}', '{', '1', ')',

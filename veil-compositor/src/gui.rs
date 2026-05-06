@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -10,7 +9,6 @@ use crate::capture_shm::ShmCapture;
 use crate::wayland_capture::WaylandCapture;
 
 const ATSPI_SCRIPT: &str = include_str!("../../atspi_query.py");
-const FRAME_MAGIC: u32   = 0x56454C43;
 
 /* ── Compositor detection ───────────────────────────────────────────────── */
 
@@ -157,41 +155,25 @@ fn find_sibling(name: &str) -> Option<PathBuf> {
     None
 }
 
-/* ── Screencopy frame reader ────────────────────────────────────────────── */
+/* ── RGBA crop ──────────────────────────────────────────────────────────── */
 
-fn read_screencopy_frame(src: &mut impl Read) -> Option<(u32, u32, Vec<u8>)> {
-    let mut hdr = [0u8; 12];
-    src.read_exact(&mut hdr).ok()?;
-    let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-    if magic != FRAME_MAGIC { return None; }
-    let w = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    let h = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
-    let n = (w * h * 4) as usize;
-    let mut data = vec![0u8; n];
-    src.read_exact(&mut data).ok()?;
-    Some((w, h, data))
-}
-
-/* ── Luma computation ───────────────────────────────────────────────────── */
-
-fn compute_luma(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> Vec<u8> {
-    let dw = cols as u32;
-    let dh = rows as u32;
-    let mut luma = vec![0u8; (dw * dh) as usize];
-    for dy in 0..dh {
-        for dx in 0..dw {
-            let sy = (dy * src_h) / dh;
-            let sx = (dx * src_w) / dw;
-            let off = (sy * src_w * 4 + sx * 4) as usize;
-            if off + 3 < rgba.len() {
-                let r = rgba[off] as u32;
-                let g = rgba[off + 1] as u32;
-                let b = rgba[off + 2] as u32;
-                luma[(dy * dw + dx) as usize] = ((66 * r + 129 * g + 25 * b + 128) >> 8) as u8;
-            }
-        }
+/// Crop a physical-pixel RGBA buffer to a logical-pixel window region.
+/// Returns (cropped_w, cropped_h, rgba) in physical pixels.
+fn crop_rgba(src: &[u8], src_w: u32, src_h: u32,
+             x: i32, y: i32, w: u32, h: u32, scale: i32) -> (u32, u32, Vec<u8>) {
+    let s  = scale.max(1) as u32;
+    let px = (x.max(0) as u32) * s;
+    let py = (y.max(0) as u32) * s;
+    let pw = (w * s).min(src_w.saturating_sub(px));
+    let ph = (h * s).min(src_h.saturating_sub(py));
+    if pw == 0 || ph == 0 { return (0, 0, Vec::new()); }
+    let mut out = Vec::with_capacity((pw * ph * 4) as usize);
+    for row in py..(py + ph) {
+        let s_off = (row * src_w + px) as usize * 4;
+        let e_off = s_off + pw as usize * 4;
+        if e_off <= src.len() { out.extend_from_slice(&src[s_off..e_off]); }
     }
-    luma
+    (pw, ph, out)
 }
 
 /* ── AT-SPI query ───────────────────────────────────────────────────────── */
@@ -218,10 +200,9 @@ fn query_atspi(script: &std::path::Path, pid: u32, geo: &Geo, cols: u16, rows: u
 /* ── GuiCompositor ──────────────────────────────────────────────────────── */
 
 pub struct GuiCompositor {
-    child:            Child,
-    screencopy_child: Option<Child>,
-    latest_luma:      Arc<Mutex<Vec<u8>>>,
-    latest_text:      Arc<Mutex<Vec<TextCell>>>,
+    child:       Child,
+    latest_rgba: Arc<Mutex<(u32, u32, Vec<u8>)>>,
+    latest_text: Arc<Mutex<Vec<TextCell>>>,
 }
 
 impl GuiCompositor {
@@ -277,44 +258,25 @@ impl GuiCompositor {
 
         let geo = Geo { x: 0, y: 0, w: win.w, h: win.h };
 
-        let latest_luma: Arc<Mutex<Vec<u8>>> =
-            Arc::new(Mutex::new(vec![0u8; cols as usize * rows as usize]));
+        let latest_rgba: Arc<Mutex<(u32, u32, Vec<u8>)>> =
+            Arc::new(Mutex::new((0, 0, Vec::new())));
         let latest_text: Arc<Mutex<Vec<TextCell>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // Decide capture backend: SHM (LD_PRELOAD) > screencopy > grim
-        let screencopy_bin = find_sibling("veil-screencopy");
-        let shm_path       = format!("/dev/shm/veil_{}", child_pid);
-
-        let mut screencopy_child: Option<Child> = None;
+        let shm_path = format!("/dev/shm/veil_{}", child_pid);
 
         // ── Capture thread ────────────────────────────────────────────────
         {
-            let luma_ref  = Arc::clone(&latest_luma);
+            let rgba_ref  = Arc::clone(&latest_rgba);
             let frame_dur = Duration::from_secs_f64(1.0 / capture_fps.max(1) as f64);
 
-            // Spawn veil-screencopy once; pull stdout out before moving child into screencopy_child
-            let sc_stdout_opt: Option<std::process::ChildStdout> = screencopy_bin.as_ref()
-                .and_then(|bin| {
-                    let mut c = Command::new(bin);
-                    c.arg(&win.app_id);
-                    if !win.title.is_empty() { c.arg(&win.title); }
-                    c.stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().ok()
-                })
-                .and_then(|mut child| {
-                    let stdout = child.stdout.take();
-                    screencopy_child = Some(child);
-                    stdout
-                });
-
-            if screencopy_child.is_some() {
-                eprintln!("[gui] veil-screencopy spawned for app_id='{}'", win.app_id);
-            }
-
-            let shm_path_clone = shm_path.clone();
-            let win_x_cap = win.x;
-            let win_y_cap = win.y;
-            let win_w_cap = win.w;
-            let win_h_cap = win.h;
+            let shm_path_clone  = shm_path.clone();
+            let win_app_id_cap  = win.app_id.clone();
+            let win_pid_cap     = win.pid;
+            let win_x_init      = win.x;
+            let win_y_init      = win.y;
+            let win_w_init      = win.w;
+            let win_h_init      = win.h;
+            let compositor_cap  = compositor;
 
             thread::spawn(move || {
                 // Give LD_PRELOAD a moment to create the SHM file
@@ -330,8 +292,7 @@ impl GuiCompositor {
                             loop {
                                 let tick = Instant::now();
                                 if let Some((w, h, _stride, pixels)) = shm.read_frame() {
-                                    *luma_ref.lock().unwrap() =
-                                        compute_luma(&pixels, w, h, cols, rows);
+                                    *rgba_ref.lock().unwrap() = (w, h, pixels);
                                 }
                                 if let Some(rem) = frame_dur.checked_sub(tick.elapsed()) {
                                     thread::sleep(rem);
@@ -342,50 +303,50 @@ impl GuiCompositor {
                     }
                 }
 
-                // ── Priority 2: veil-screencopy ───────────────────────────
-                // Runs until the process exits or produces an invalid frame,
-                // then falls through to grim — never return early.
-                if let Some(stdout) = sc_stdout_opt {
-                    eprintln!("[capture] veil-screencopy");
-                    let mut reader = std::io::BufReader::new(stdout);
-                    loop {
-                        let tick = Instant::now();
-                        match read_screencopy_frame(&mut reader) {
-                            Some((w, h, rgba)) => {
-                                *luma_ref.lock().unwrap() =
-                                    compute_luma(&rgba, w, h, cols, rows);
-                            }
-                            None => {
-                                eprintln!("[capture] veil-screencopy exited — falling back to grim");
-                                break;
-                            }
-                        }
-                        if let Some(rem) = frame_dur.checked_sub(tick.elapsed()) {
-                            thread::sleep(rem);
-                        }
-                    }
-                }
-
-                // ── Priority 3: wlr-screencopy (Rust, window region) ─────
-                // Works on both Niri and Hyprland. Uses actual window coords.
-                let win_x = win_x_cap;
-                let win_y = win_y_cap;
-                let win_w = win_w_cap;
-                let win_h = win_h_cap;
-
+                // ── Priority 2: wlr-screencopy (full output + crop) ─────
+                // Capture the full output each frame and crop to the window
+                // region. Re-polls compositor IPC every 500ms for resize.
                 match WaylandCapture::connect() {
                     Some(mut wc) => {
-                        eprintln!("[capture] wlr-screencopy ({win_w}x{win_h} @ {win_x},{win_y})");
+                        let scale = wc.output_scale();
+
+                        let mut wx = win_x_init;
+                        let mut wy = win_y_init;
+                        let mut ww = win_w_init;
+                        let mut wh = win_h_init;
+                        let mut win_poll = Instant::now();
+                        let poll_interval = Duration::from_millis(500);
+
+                        eprintln!("[capture] wlr-screencopy full+crop '{}' ({}x{} @ {},{})",
+                            win_app_id_cap, ww, wh, wx, wy);
+
                         loop {
                             let tick = Instant::now();
-                            let result = if win_w > 0 && win_h > 0 {
-                                wc.capture_region(win_x, win_y, win_w, win_h)
-                            } else {
-                                wc.capture_full()
-                            };
-                            if let Some((w, h, rgba)) = result {
-                                *luma_ref.lock().unwrap() = compute_luma(&rgba, w, h, cols, rows);
+
+                            // Re-poll window bounds for live resize/move support
+                            if win_poll.elapsed() >= poll_interval {
+                                if let Some(w) = list_windows(compositor_cap)
+                                    .into_iter()
+                                    .find(|w| w.app_id == win_app_id_cap || w.pid == win_pid_cap)
+                                {
+                                    if w.x != wx || w.y != wy || w.w != ww || w.h != wh {
+                                        eprintln!("[capture] window resized {}x{} @ {},{}",
+                                            w.w, w.h, w.x, w.y);
+                                        wx = w.x; wy = w.y; ww = w.w; wh = w.h;
+                                    }
+                                }
+                                win_poll = Instant::now();
                             }
+
+                            if let Some((fw, fh, full)) = wc.capture_full() {
+                                let (cw, ch, cropped) = crop_rgba(
+                                    &full, fw, fh, wx, wy, ww, wh, scale,
+                                );
+                                if cw > 0 && ch > 0 {
+                                    *rgba_ref.lock().unwrap() = (cw, ch, cropped);
+                                }
+                            }
+
                             if let Some(rem) = frame_dur.checked_sub(tick.elapsed()) {
                                 thread::sleep(rem);
                             } else {
@@ -393,28 +354,10 @@ impl GuiCompositor {
                             }
                         }
                     }
+
                     None => {
-                        // ── Priority 4: grim fullscreen (last resort) ─────
-                        eprintln!("[capture] grim (wlr-screencopy unavailable)");
-                        loop {
-                            let tick = Instant::now();
-                            if let Ok(png) = grim_capture() {
-                                if !png.is_empty() {
-                                    if let Ok(img) = image::load_from_memory_with_format(
-                                        &png, image::ImageFormat::Png)
-                                    {
-                                        let rgba = img.to_rgba8();
-                                        *luma_ref.lock().unwrap() = compute_luma(
-                                            rgba.as_raw(), rgba.width(), rgba.height(), cols, rows);
-                                    }
-                                }
-                            }
-                            if let Some(rem) = frame_dur.checked_sub(tick.elapsed()) {
-                                thread::sleep(rem);
-                            } else {
-                                thread::sleep(Duration::from_millis(16));
-                            }
-                        }
+                        eprintln!("[capture] zwlr_screencopy_manager_v1 not available — idling");
+                        loop { thread::sleep(Duration::from_millis(500)); }
                     }
                 }
             });
@@ -438,11 +381,11 @@ impl GuiCompositor {
         }
 
         thread::sleep(Duration::from_millis(300));
-        Self { child, screencopy_child, latest_luma, latest_text }
+        Self { child, latest_rgba, latest_text }
     }
 
-    pub fn capture_luma(&self) -> Vec<u8> {
-        self.latest_luma.lock().unwrap().clone()
+    pub fn capture_rgba(&self) -> (u32, u32, Vec<u8>) {
+        self.latest_rgba.lock().unwrap().clone()
     }
 
     pub fn capture_text(&self) -> Vec<TextCell> {
@@ -457,20 +400,7 @@ impl GuiCompositor {
 impl Drop for GuiCompositor {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        if let Some(ref mut sc) = self.screencopy_child {
-            let _ = sc.kill();
-        }
     }
-}
-
-/* ── Grim fallback ──────────────────────────────────────────────────────── */
-
-fn grim_capture() -> std::io::Result<Vec<u8>> {
-    Command::new("grim")
-        .arg("-")
-        .stdout(Stdio::piped())
-        .output()
-        .map(|o| o.stdout)
 }
 
 fn compositor_name(k: CompositorKind) -> &'static str {
