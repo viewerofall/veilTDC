@@ -1,11 +1,11 @@
 use std::collections::HashSet;
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use veil_render::TextCell;
-use crate::capture_shm::ShmCapture;
 use crate::wayland_capture::WaylandCapture;
 
 const ATSPI_SCRIPT: &str = include_str!("../../atspi_query.py");
@@ -48,13 +48,34 @@ fn list_niri_windows() -> Vec<WindowInfo> {
                     let pid    = w["pid"].as_u64()? as u32;
                     let app_id = w["app_id"].as_str().unwrap_or("").to_string();
                     let title  = w["title"].as_str().unwrap_or("").to_string();
-                    // "geometry" gives logical-pixel position + size on the output
-                    let geo = &w["geometry"];
-                    let x  = geo["x"].as_i64().unwrap_or(0) as i32;
-                    let y  = geo["y"].as_i64().unwrap_or(0) as i32;
-                    let ww = geo["width"].as_u64().unwrap_or(0) as u32;
-                    let wh = geo["height"].as_u64().unwrap_or(0) as u32;
+
+                    // Extract window size from layout
+                    let layout = &w["layout"];
+                    let window_size = layout["window_size"].as_array()?;
+                    let ww = window_size[0].as_i64()? as u32;
+                    let wh = window_size[1].as_i64()? as u32;
+
                     if ww == 0 || wh == 0 { return None; }
+
+                    // For position: try to use tile_size and tile_pos, or default to 0,0
+                    // (Niri doesn't expose absolute screen coordinates easily)
+                    let tile_size = layout["tile_size"].as_array();
+                    let tile_pos = layout["tile_pos_in_workspace_view"].as_array();
+                    let offset = layout["window_offset_in_tile"].as_array();
+
+                    let (x, y) = if let (Some(ts), Some(tp), Some(off)) = (tile_size, tile_pos, offset) {
+                        let tile_w = ts[0].as_f64().unwrap_or(0.0) as i32;
+                        let tile_h = ts[1].as_f64().unwrap_or(0.0) as i32;
+                        let col = tp[0].as_i64().unwrap_or(0) as i32;
+                        let row = tp[1].as_i64().unwrap_or(0) as i32;
+                        let off_x = off[0].as_f64().unwrap_or(0.0) as i32;
+                        let off_y = off[1].as_f64().unwrap_or(0.0) as i32;
+                        (col * tile_w + off_x, row * tile_h + off_y)
+                    } else {
+                        (0, 0)
+                    };
+
+                    eprintln!("[window] {} (pid={}) size={}x{} pos={},{}", app_id, pid, ww, wh, x, y);
                     Some(WindowInfo { pid, app_id, title, x, y, w: ww, h: wh })
                 })
                 .collect(),
@@ -87,6 +108,40 @@ fn list_hyprland_windows() -> Vec<WindowInfo> {
         )
     })()
     .unwrap_or_default()
+}
+
+fn wayland_sockets() -> HashSet<String> {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+    std::fs::read_dir(&dir).ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("wayland-")
+                && e.metadata().ok().map(|m| m.file_type().is_socket()).unwrap_or(false)
+            { Some(name) } else { None }
+        })
+        .collect()
+}
+
+fn wait_for_new_socket(existing: &HashSet<String>, timeout: Duration) -> Option<String> {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("wayland-") && !existing.contains(&name) {
+                    if entry.metadata().ok().map(|m| m.file_type().is_socket()).unwrap_or(false) {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    None
 }
 
 fn list_windows(kind: CompositorKind) -> Vec<WindowInfo> {
@@ -208,179 +263,79 @@ pub struct GuiCompositor {
 impl GuiCompositor {
     pub fn launch(
         app:            &str,
-        cols:           u16,
-        rows:           u16,
-        window_timeout: Duration,
+        _cols:          u16,
+        _rows:          u16,
+        _window_timeout: Duration,
         capture_fps:    u32,
     ) -> Self {
-        let compositor = detect_compositor();
-        let known      = snapshot_pids(compositor);
-        eprintln!("[gui] compositor={:?} existing_pids={}", compositor_name(compositor), known.len());
+        // Snapshot existing wayland sockets so we can detect cage's new one.
+        let existing_sockets = wayland_sockets();
+        eprintln!("[gui] existing sockets: {:?}", existing_sockets);
 
-        // Find libveil_capture.so for LD_PRELOAD injection
-        let preload_so = find_sibling("libveil_capture.so");
-        if let Some(ref p) = preload_so {
-            eprintln!("[gui] LD_PRELOAD={}", p.display());
-        }
-
-        let mut cmd = Command::new(app);
-        cmd.env("ACCESSIBILITY_ENABLED", "1")
-           .env("GTK_MODULES", "gail:atk-bridge")
-           .stdout(Stdio::null())
-           .stderr(Stdio::null());
-
-        if let Some(ref so) = preload_so {
-            cmd.env("LD_PRELOAD", so);
-        }
-
-        let child     = cmd.spawn().unwrap_or_else(|e| panic!("failed to launch `{app}`: {e}"));
-        let child_pid = child.id();
-        eprintln!("[gui] launched pid={}", child_pid);
-
-        let win = match wait_for_new_window(&known, child_pid, compositor, window_timeout) {
-            Some(w) => {
-                eprintln!("[gui] window app_id='{}' title='{}' size={}×{}", w.app_id, w.title, w.w, w.h);
-                w
-            }
-            None => {
-                eprintln!("[gui] no window found — fullscreen fallback");
-                WindowInfo {
-                    pid:    child_pid,
-                    app_id: app.to_string(),
-                    title:  String::new(),
-                    x:      0,
-                    y:      0,
-                    w:      1920,
-                    h:      1080,
-                }
-            }
-        };
-
-        let geo = Geo { x: 0, y: 0, w: win.w, h: win.h };
+        // Launch app inside cage (isolated Wayland compositor).
+        // cage creates its own zwlr_screencopy_manager_v1 — only the app is visible.
+        let child = Command::new("cage")
+            .arg("--")
+            .arg(app)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to launch cage: {e}"));
+        let cage_pid = child.id();
+        eprintln!("[gui] cage pid={}", cage_pid);
 
         let latest_rgba: Arc<Mutex<(u32, u32, Vec<u8>)>> =
             Arc::new(Mutex::new((0, 0, Vec::new())));
         let latest_text: Arc<Mutex<Vec<TextCell>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let shm_path = format!("/dev/shm/veil_{}", child_pid);
 
         // ── Capture thread ────────────────────────────────────────────────
         {
             let rgba_ref  = Arc::clone(&latest_rgba);
             let frame_dur = Duration::from_secs_f64(1.0 / capture_fps.max(1) as f64);
 
-            let shm_path_clone  = shm_path.clone();
-            let win_app_id_cap  = win.app_id.clone();
-            let win_pid_cap     = win.pid;
-            let win_x_init      = win.x;
-            let win_y_init      = win.y;
-            let win_w_init      = win.w;
-            let win_h_init      = win.h;
-            let compositor_cap  = compositor;
-
             thread::spawn(move || {
-                // Give LD_PRELOAD a moment to create the SHM file
-                thread::sleep(Duration::from_millis(200));
+                // Wait for cage's Wayland socket to appear
+                let runtime_dir =
+                    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
 
-                // ── Priority 1: SHM (LD_PRELOAD) ──────────────────────────
-                // Only enter if the SHM file exists AND opens successfully.
-                // If either fails, fall through — never return early.
-                if std::path::Path::new(&shm_path_clone).exists() {
-                    match ShmCapture::open(child_pid) {
-                        Some(mut shm) => {
-                            eprintln!("[capture] SHM (LD_PRELOAD)");
-                            loop {
-                                let tick = Instant::now();
-                                if let Some((w, h, _stride, pixels)) = shm.read_frame() {
-                                    *rgba_ref.lock().unwrap() = (w, h, pixels);
-                                }
-                                if let Some(rem) = frame_dur.checked_sub(tick.elapsed()) {
-                                    thread::sleep(rem);
-                                }
-                            }
-                        }
-                        None => eprintln!("[capture] SHM file exists but open failed — skipping"),
+                let cage_socket = match wait_for_new_socket(&existing_sockets, Duration::from_secs(10)) {
+                    Some(s) => s,
+                    None => {
+                        eprintln!("[capture] cage socket never appeared — idling");
+                        loop { thread::sleep(Duration::from_millis(500)); }
                     }
-                }
+                };
 
-                // ── Priority 2: wlr-screencopy (full output + crop) ─────
-                // Capture the full output each frame and crop to the window
-                // region. Re-polls compositor IPC every 500ms for resize.
-                match WaylandCapture::connect() {
+                let socket_path = format!("{}/{}", runtime_dir, cage_socket);
+                eprintln!("[capture] cage socket: {}", socket_path);
+
+                // Give cage a moment to finish initializing its compositor
+                thread::sleep(Duration::from_millis(300));
+
+                match WaylandCapture::connect_to_socket(&socket_path) {
                     Some(mut wc) => {
-                        let scale = wc.output_scale();
-
-                        let mut wx = win_x_init;
-                        let mut wy = win_y_init;
-                        let mut ww = win_w_init;
-                        let mut wh = win_h_init;
-                        let mut win_poll = Instant::now();
-                        let poll_interval = Duration::from_millis(500);
-
-                        eprintln!("[capture] wlr-screencopy full+crop '{}' ({}x{} @ {},{})",
-                            win_app_id_cap, ww, wh, wx, wy);
-
+                        eprintln!("[capture] screencopy connected to cage");
                         loop {
                             let tick = Instant::now();
-
-                            // Re-poll window bounds for live resize/move support
-                            if win_poll.elapsed() >= poll_interval {
-                                if let Some(w) = list_windows(compositor_cap)
-                                    .into_iter()
-                                    .find(|w| w.app_id == win_app_id_cap || w.pid == win_pid_cap)
-                                {
-                                    if w.x != wx || w.y != wy || w.w != ww || w.h != wh {
-                                        eprintln!("[capture] window resized {}x{} @ {},{}",
-                                            w.w, w.h, w.x, w.y);
-                                        wx = w.x; wy = w.y; ww = w.w; wh = w.h;
-                                    }
-                                }
-                                win_poll = Instant::now();
+                            if let Some((w, h, rgba)) = wc.capture_full() {
+                                *rgba_ref.lock().unwrap() = (w, h, rgba);
                             }
-
-                            if let Some((fw, fh, full)) = wc.capture_full() {
-                                let (cw, ch, cropped) = crop_rgba(
-                                    &full, fw, fh, wx, wy, ww, wh, scale,
-                                );
-                                if cw > 0 && ch > 0 {
-                                    *rgba_ref.lock().unwrap() = (cw, ch, cropped);
-                                }
-                            }
-
                             if let Some(rem) = frame_dur.checked_sub(tick.elapsed()) {
                                 thread::sleep(rem);
                             } else {
-                                thread::sleep(Duration::from_millis(16));
+                                thread::sleep(Duration::from_millis(8));
                             }
                         }
                     }
-
                     None => {
-                        eprintln!("[capture] zwlr_screencopy_manager_v1 not available — idling");
+                        eprintln!("[capture] could not connect screencopy to cage — idling");
                         loop { thread::sleep(Duration::from_millis(500)); }
                     }
                 }
             });
         }
 
-        // ── AT-SPI thread ─────────────────────────────────────────────────
-        {
-            let text_ref = Arc::clone(&latest_text);
-            let win_pid  = win.pid;
-            let g        = geo.clone();
-
-            let script = std::env::temp_dir().join("veil_atspi.py");
-            let _ = std::fs::write(&script, ATSPI_SCRIPT);
-
-            thread::spawn(move || loop {
-                if let Some(cells) = query_atspi(&script, win_pid, &g, cols, rows) {
-                    *text_ref.lock().unwrap() = cells;
-                }
-                thread::sleep(Duration::from_millis(500));
-            });
-        }
-
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(200));
         Self { child, latest_rgba, latest_text }
     }
 

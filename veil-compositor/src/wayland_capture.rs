@@ -11,6 +11,7 @@
 ///      create wl_shm_pool + wl_buffer, call `frame.copy(buffer)`
 ///   3. Compositor fires `ready` → pixels in mmap; return to caller
 ///   4. Compositor fires `failed` → return None
+use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::slice;
 
@@ -86,8 +87,9 @@ struct PendingFrame {
 struct CaptureState {
     shm:          Option<WlShm>,
     manager:      Option<ZwlrScreencopyManagerV1>,
-    output:       Option<WlOutput>,
+    outputs:      Vec<WlOutput>,
     output_scale: i32,
+    target_idx:   usize,
     // per-frame
     pending:      Option<PendingFrame>,
     frame_ready:  bool,
@@ -95,10 +97,10 @@ struct CaptureState {
 }
 
 impl CaptureState {
-    fn new() -> Self {
+    fn new(target_idx: usize) -> Self {
         Self {
-            shm: None, manager: None, output: None,
-            output_scale: 1,
+            shm: None, manager: None, outputs: Vec::new(),
+            output_scale: 1, target_idx,
             pending: None, frame_ready: false, frame_failed: false,
         }
     }
@@ -116,9 +118,7 @@ impl Dispatch<WlRegistry, ()> for CaptureState {
             "zwlr_screencopy_manager_v1" =>
                 state.manager = Some(reg.bind(name, version.min(3), qh, ())),
             "wl_output" =>
-                if state.output.is_none() {
-                    state.output = Some(reg.bind(name, version.clamp(2, 4), qh, ()));
-                },
+                state.outputs.push(reg.bind(name, version.clamp(2, 4), qh, ())),
             _ => {}
         }
     }
@@ -191,9 +191,9 @@ pub struct WaylandCapture {
 }
 
 impl WaylandCapture {
-    /// Connect to the running compositor and bind required globals.
-    /// Returns None if the compositor doesn't support `zwlr_screencopy_manager_v1`.
-    pub fn connect() -> Option<Self> {
+    /// Connect and capture from a specific output index (0 = primary, 1 = secondary, etc).
+    /// Falls back to 0 if the requested index doesn't exist.
+    pub fn connect_output(output_index: usize) -> Option<Self> {
         let conn = Connection::connect_to_env().ok()?;
         let mut eq = conn.new_event_queue();
         let qh     = eq.handle();
@@ -201,20 +201,59 @@ impl WaylandCapture {
         let display = conn.display();
         display.get_registry(&qh, ());
 
-        let mut state = CaptureState::new();
+        let mut state = CaptureState::new(output_index);
         eq.roundtrip(&mut state).ok()?;
-        eq.roundtrip(&mut state).ok()?; // second round-trip for wl_output scale
+        eq.roundtrip(&mut state).ok()?;
 
         if state.manager.is_none() {
             eprintln!("[wayland_capture] zwlr_screencopy_manager_v1 not available");
             return None;
         }
-        if state.output.is_none() {
+        if state.outputs.is_empty() {
             eprintln!("[wayland_capture] no wl_output bound");
             return None;
         }
 
-        eprintln!("[wayland_capture] connected (output scale={})", state.output_scale);
+        // Clamp index to available outputs
+        if output_index >= state.outputs.len() {
+            eprintln!("[wayland_capture] output {} not available, using 0 (have {})",
+                output_index, state.outputs.len());
+            state.target_idx = 0;
+        }
+
+        eprintln!("[wayland_capture] connected output={}/{} scale={}",
+            state.target_idx, state.outputs.len(), state.output_scale);
+        Some(Self { conn, eq, state, qh })
+    }
+
+    /// Connect to primary output (convenience wrapper).
+    pub fn connect() -> Option<Self> {
+        Self::connect_output(0)
+    }
+
+    /// Connect to a specific Wayland socket by path (e.g. cage's isolated display).
+    pub fn connect_to_socket(socket_path: &str) -> Option<Self> {
+        let stream = UnixStream::connect(socket_path).ok()?;
+        let conn = Connection::from_socket(stream).ok()?;
+        let mut eq = conn.new_event_queue();
+        let qh = eq.handle();
+
+        conn.display().get_registry(&qh, ());
+
+        let mut state = CaptureState::new(0);
+        eq.roundtrip(&mut state).ok()?;
+        eq.roundtrip(&mut state).ok()?;
+
+        if state.manager.is_none() {
+            eprintln!("[wayland_capture] socket {}: no zwlr_screencopy_manager_v1", socket_path);
+            return None;
+        }
+        if state.outputs.is_empty() {
+            eprintln!("[wayland_capture] socket {}: no wl_output", socket_path);
+            return None;
+        }
+
+        eprintln!("[wayland_capture] connected to {} (scale={})", socket_path, state.output_scale);
         Some(Self { conn, eq, state, qh })
     }
 
@@ -232,7 +271,7 @@ impl WaylandCapture {
     pub fn capture_region(&mut self, x: i32, y: i32, w: u32, h: u32) -> Option<(u32, u32, Vec<u8>)> {
         let scale   = self.state.output_scale.max(1);
         let manager = self.state.manager.as_ref()?;
-        let output  = self.state.output.as_ref()?;
+        let output  = self.state.outputs.get(self.state.target_idx)?;
 
         let _frame = manager.capture_output_region(
             0, output,
@@ -263,10 +302,10 @@ impl WaylandCapture {
         Some((pf.width, pf.height, rgba))
     }
 
-    /// Capture the full primary output.
+    /// Capture the full target output.
     pub fn capture_full(&mut self) -> Option<(u32, u32, Vec<u8>)> {
         let manager = self.state.manager.as_ref()?;
-        let output  = self.state.output.as_ref()?;
+        let output  = self.state.outputs.get(self.state.target_idx)?;
 
         let _frame = manager.capture_output(0, output, &self.qh, ());
 

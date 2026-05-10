@@ -1,3 +1,5 @@
+mod input;
+
 use clap::{Parser, Subcommand};
 use crossterm::{cursor, execute, terminal::{self, EnterAlternateScreen, LeaveAlternateScreen}};
 use std::{
@@ -108,6 +110,12 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
         capture_fps,
     );
 
+    // Window is already focused by GuiCompositor during launch
+    // Input events will be injected via xdg-desktop-portal or xdotool
+
+    // Spawn input thread for keyboard/mouse events
+    let input_rx = input::spawn_input_thread();
+
     let alive = Arc::new(AtomicBool::new(true));
     let alive_ks = Arc::clone(&alive);
     thread::spawn(move || {
@@ -130,8 +138,9 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     let _ = terminal::enable_raw_mode();
     let _ = execute!(stdout, EnterAlternateScreen, cursor::Hide);
 
-    let result = color_dirty_loop(
+    let result = color_dirty_loop_with_input(
         &alive, cols, rows, budget, &mut stdout,
+        input_rx,
         || {
             if !compositor.is_running() {
                 alive.store(false, Ordering::SeqCst);
@@ -147,6 +156,59 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
     result
+}
+
+// ── Colour render loop with input ───────────────────────────────────────────
+
+fn color_dirty_loop_with_input(
+    alive: &AtomicBool,
+    cols: u16,
+    rows: u16,
+    budget: Duration,
+    stdout: &mut io::Stdout,
+    input_rx: std::sync::mpsc::Receiver<input::InputEvent>,
+    mut capture: impl FnMut() -> Vec<ColorCell>,
+) -> io::Result<()> {
+    let black = ColorCell { fg: [0, 0, 0], bg: [0, 0, 0] };
+    let mut prev = vec![black; cols as usize * rows as usize];
+
+    while alive.load(Ordering::SeqCst) {
+        let tick = Instant::now();
+
+        // Process any pending input events
+        while let Ok(ev) = input_rx.try_recv() {
+            let _ = input::handle_input_event(&ev);
+        }
+
+        let curr = capture();
+
+        for row in 0..rows {
+            let s = row as usize * cols as usize;
+            let e = (s + cols as usize).min(curr.len());
+            if e <= s || curr[s..e] == prev[s..e] { continue; }
+
+            execute!(stdout, cursor::MoveTo(0, row))?;
+            let mut line = String::with_capacity(cols as usize * 32);
+            for cell in &curr[s..e] {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    line,
+                    "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u{2580}",
+                    cell.fg[0], cell.fg[1], cell.fg[2],
+                    cell.bg[0], cell.bg[1], cell.bg[2],
+                );
+            }
+            line.push_str("\x1b[0m");
+            write!(stdout, "{line}")?;
+        }
+        stdout.flush()?;
+        prev = curr;
+
+        if let Some(rem) = budget.checked_sub(tick.elapsed()) {
+            thread::sleep(rem);
+        }
+    }
+    Ok(())
 }
 
 // ── Colour render loop ────────────────────────────────────────────────────────
