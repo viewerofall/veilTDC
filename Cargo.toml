@@ -11,5 +11,6 @@ ctrlc        = "3"
 portable-pty = "0.8"
 vt100        = "0.15"
 wayland-client        = "0.31"
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr  = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 rustix                = { version = "1", features = ["mm", "fs"] }

@@ -22,17 +22,17 @@ use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 use wayland_client::{
     delegate_noop,
     protocol::{
-        wl_buffer::{self, WlBuffer},
+        wl_buffer::WlBuffer,
         wl_output::{self, WlOutput},
         wl_registry::{self, WlRegistry},
         wl_shm::{self, WlShm},
-        wl_shm_pool::{self, WlShmPool},
+        wl_shm_pool::WlShmPool,
     },
     Connection, Dispatch, QueueHandle, WEnum,
 };
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
-    zwlr_screencopy_manager_v1::{self, ZwlrScreencopyManagerV1},
+    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
 /* ── SHM allocation ──────────────────────────────────────────────────────── */
@@ -73,6 +73,7 @@ impl Drop for ShmAlloc {
 
 /* ── Per-frame pending state ─────────────────────────────────────────────── */
 
+#[allow(dead_code)]
 struct PendingFrame {
     alloc:  ShmAlloc,
     pool:   WlShmPool,
@@ -184,12 +185,14 @@ delegate_noop!(CaptureState: ignore ZwlrScreencopyManagerV1);
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 pub struct WaylandCapture {
+    #[allow(dead_code)]
     conn:  Connection,
     eq:    wayland_client::EventQueue<CaptureState>,
     state: CaptureState,
     qh:    QueueHandle<CaptureState>,
 }
 
+#[allow(dead_code)]
 impl WaylandCapture {
     /// Connect and capture from a specific output index (0 = primary, 1 = secondary, etc).
     /// Falls back to 0 if the requested index doesn't exist.

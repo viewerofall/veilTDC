@@ -25,6 +25,9 @@ Cargo.lock
 *.iml
 .vim/
 
+# Reference repos
+/texttop/
+
 # Build outputs
 *.zig.o
 /libveil_capture.so

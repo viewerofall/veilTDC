@@ -177,3 +177,69 @@ pub fn apply_text_overlay(chars: &mut [char], text: &[TextCell], cols: u16) {
         }
     }
 }
+
+// ── Kitty graphics protocol ───────────────────────────────────────────────────
+
+/// Encode an RGBA frame as a Kitty graphics protocol escape sequence.
+///
+/// Downsamples to `cols × rows*2` pixels (one kitty "pixel row" per half-block
+/// row), base64-encodes the raw RGBA, and emits chunked APC sequences.
+/// Returns a single string: delete-previous + full new frame.
+///
+/// Protocol: `ESC_G<params>;<b64>ESC\`  (APC, not OSC)
+pub fn render_kitty_frame(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> String {
+    const CLEAR: &str = "\x1b_Ga=d,d=a,q=2\x1b\\";
+    const CHUNK: usize = 4096;
+
+    // Downsample: 1 pixel per col, 2 pixels per row (matches halfblock parity)
+    let dst_w = cols as u32;
+    let dst_h = rows as u32 * 2;
+
+    let img = match RgbaImage::from_raw(src_w, src_h, rgba.to_vec()) {
+        Some(i) => i,
+        None    => return CLEAR.to_string(),
+    };
+    let resized = DynamicImage::ImageRgba8(img)
+        .resize_exact(dst_w, dst_h, imageops::FilterType::Triangle)
+        .to_rgba8();
+
+    let b64 = base64_encode(resized.as_raw());
+    let b64_bytes = b64.as_bytes();
+    let num_chunks = (b64_bytes.len() + CHUNK - 1).max(1) / CHUNK;
+    let mut out = String::with_capacity(CLEAR.len() + b64.len() + num_chunks * 80);
+
+    out.push_str(CLEAR);
+
+    for (i, chunk) in b64_bytes.chunks(CHUNK).enumerate() {
+        let s    = std::str::from_utf8(chunk).unwrap_or("");
+        let more = if i + 1 < num_chunks { 1 } else { 0 };
+        if i == 0 {
+            use std::fmt::Write as _;
+            let _ = write!(
+                out,
+                "\x1b_Ga=T,f=32,s={dst_w},v={dst_h},c={cols},r={rows},q=2,m={more};{s}\x1b\\"
+            );
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\x1b_Gm={more};{s}\x1b\\");
+        }
+    }
+
+    out
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity((data.len() + 2) / 3 * 4);
+    for c in data.chunks(3) {
+        let b0 = c[0] as u32;
+        let b1 = c.get(1).copied().unwrap_or(0) as u32;
+        let b2 = c.get(2).copied().unwrap_or(0) as u32;
+        let n  = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize]);
+        out.push(T[((n >> 12) & 63) as usize]);
+        out.push(if c.len() > 1 { T[((n >> 6) & 63) as usize] } else { b'=' });
+        out.push(if c.len() > 2 { T[(n & 63) as usize] } else { b'=' });
+    }
+    String::from_utf8(out).unwrap()
+}

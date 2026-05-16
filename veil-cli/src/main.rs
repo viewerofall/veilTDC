@@ -9,16 +9,18 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use veil_compositor::{GuiCompositor, TermCompositor};
-use veil_config::load as load_config;
-use veil_render::{render_chars, rgba_to_halfblocks, ColorCell};
+use veil_compositor::{GuiCompositor, TermCompositor, WaylandInput};
+use veil_config::{load as load_config, Quality};
+use veil_render::{compute_luma, luma_to_chars, render_chars, render_kitty_frame, rgba_to_halfblocks, ColorCell};
 
 #[derive(Parser)]
 #[command(name = "veil", about = "Terminal display compositor — any app, any terminal")]
 struct Cli {
-    #[arg(long, default_value = "config.lua")]
-    config: PathBuf,
+    /// Path to config file (default: ~/.config/veil-config.lua)
+    #[arg(long)]
+    config: Option<PathBuf>,
 
+    /// Override config values, e.g. --override fps=60,quality=pixel
     #[arg(long = "override", value_delimiter = ',', value_name = "KEY=VALUE")]
     overrides: Vec<String>,
 
@@ -30,28 +32,42 @@ struct Cli {
 enum Command {
     /// Run a TUI/terminal app. Ctrl+C exits.
     Run { app: String },
-    /// Run a GUI app (captures with grim + Niri IPC). Ctrl+C exits.
+    /// Run a GUI app captured via cage compositor. Ctrl+C exits.
     RunGui { app: String },
-    /// Show terminal capabilities and active config
+    /// Show terminal capabilities and resolved config.
     Probe,
+    /// Send a test kitty graphics frame directly (no cage, no alt-screen).
+    TestKitty,
+}
+
+fn default_config_path() -> PathBuf {
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".config/veil-config.lua"))
+        .unwrap_or_else(|_| PathBuf::from("veil-config.lua"))
 }
 
 fn main() -> io::Result<()> {
-    let cli = Cli::parse();
-    let mut cfg = load_config(&cli.config);
+    let cli         = Cli::parse();
+    let config_path = cli.config.unwrap_or_else(default_config_path);
+    let mut cfg     = load_config(&config_path);
 
     for kv in &cli.overrides {
         if let Some((key, val)) = kv.split_once('=') {
-            if key.trim() == "fps" {
-                if let Ok(n) = val.trim().parse() { cfg.fps = n; }
+            match key.trim() {
+                "fps"               => { if let Ok(n) = val.trim().parse() { cfg.fps = n; } }
+                "quality"           => { cfg.quality = Quality::from_str(val.trim()); }
+                "cage_timeout_secs" => { if let Ok(n) = val.trim().parse() { cfg.cage_timeout_secs = n; } }
+                "input"             => { cfg.input = !matches!(val.trim(), "false" | "0" | "off"); }
+                _ => {}
             }
         }
     }
 
     match cli.command {
-        Command::Run    { app } => run_tui(app, cfg),
-        Command::RunGui { app } => run_gui(app, cfg),
-        Command::Probe          => probe(cfg),
+        Command::Run       { app } => run_tui(app, cfg),
+        Command::RunGui    { app } => run_gui(app, cfg),
+        Command::Probe             => probe(cfg),
+        Command::TestKitty         => test_kitty(),
     }
 }
 
@@ -63,7 +79,7 @@ fn run_tui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     let mut pty_writer = compositor.launch(&app, cols, rows);
     thread::sleep(Duration::from_millis(300));
 
-    let alive = Arc::new(AtomicBool::new(true));
+    let alive    = Arc::new(AtomicBool::new(true));
     let alive_in = Arc::clone(&alive);
     thread::spawn(move || {
         let stdin = io::stdin();
@@ -103,90 +119,97 @@ fn run_tui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
 fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
     let capture_fps  = (cfg.fps / 2).max(5);
+    let quality      = cfg.resolved_quality();
+
+    eprintln!("[veil] quality={} fps={} cage_timeout={}s input={}",
+        quality.as_str(), cfg.fps, cfg.cage_timeout_secs, cfg.input);
 
     let mut compositor = GuiCompositor::launch(
         &app, cols, rows,
-        Duration::from_secs(8),
+        Duration::from_secs(cfg.cage_timeout_secs as u64),
         capture_fps,
     );
 
-    // Window is already focused by GuiCompositor during launch
-    // Input events will be injected via xdg-desktop-portal or xdotool
-
-    // Spawn input thread for keyboard/mouse events
-    let input_rx = input::spawn_input_thread();
-
-    let alive = Arc::new(AtomicBool::new(true));
-    let alive_ks = Arc::clone(&alive);
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut buf = [0u8; 64];
-        loop {
-            match stdin.lock().read(&mut buf) {
-                Ok(0) | Err(_)                        => break,
-                Ok(n) if buf[..n].contains(&0x03) => {
-                    alive_ks.store(false, Ordering::SeqCst);
-                    break;
-                }
-                _ => {}
-            }
+    let wayland_input = if cfg.input {
+        let wi = compositor.cage_socket.as_deref()
+            .and_then(WaylandInput::connect_to_socket);
+        if wi.is_none() {
+            eprintln!("[input] virtual input unavailable — keyboard/mouse injection disabled");
         }
-    });
+        wi
+    } else {
+        eprintln!("[input] disabled by config");
+        None
+    };
 
-    let budget = Duration::from_secs_f64(1.0 / cfg.fps.max(1) as f64);
+    let input_rx   = input::spawn_input_thread();
+    let alive      = Arc::new(AtomicBool::new(true));
+    let budget     = Duration::from_secs_f64(1.0 / cfg.fps.max(1) as f64);
     let mut stdout = io::stdout();
     let _ = terminal::enable_raw_mode();
     let _ = execute!(stdout, EnterAlternateScreen, cursor::Hide);
 
-    let result = color_dirty_loop_with_input(
-        &alive, cols, rows, budget, &mut stdout,
-        input_rx,
-        || {
-            if !compositor.is_running() {
-                alive.store(false, Ordering::SeqCst);
-            }
-            let (w, h, rgba) = compositor.capture_rgba();
-            if w == 0 || h == 0 || rgba.is_empty() {
-                return vec![ColorCell { fg: [0, 0, 0], bg: [0, 0, 0] }; cols as usize * rows as usize];
-            }
-            rgba_to_halfblocks(&rgba, w, h, cols, rows)
-        },
-    );
+    let result = match quality {
+        Quality::AsciiLuma | Quality::AsciiEdge => {
+            let edge = quality == Quality::AsciiEdge;
+            ascii_gui_loop(&alive, cols, rows, budget, &mut stdout,
+                input_rx, wayland_input, &mut compositor, edge)
+        }
+        Quality::Kitty => {
+            kitty_gui_loop(&alive, cols, rows, budget, &mut stdout,
+                input_rx, wayland_input, &mut compositor)
+        }
+        Quality::Sixel => {
+            eprintln!("[render] sixel not yet implemented, falling back to pixel");
+            pixel_gui_loop(&alive, cols, rows, budget, &mut stdout,
+                input_rx, wayland_input, &mut compositor)
+        }
+        _ => pixel_gui_loop(&alive, cols, rows, budget, &mut stdout,
+                input_rx, wayland_input, &mut compositor),
+    };
 
     let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
     result
 }
 
-// ── Colour render loop with input ───────────────────────────────────────────
+// ── Pixel GUI loop (color halfblocks) ────────────────────────────────────────
 
-fn color_dirty_loop_with_input(
-    alive: &AtomicBool,
-    cols: u16,
-    rows: u16,
-    budget: Duration,
-    stdout: &mut io::Stdout,
-    input_rx: std::sync::mpsc::Receiver<input::InputEvent>,
-    mut capture: impl FnMut() -> Vec<ColorCell>,
+fn pixel_gui_loop(
+    alive:         &AtomicBool,
+    mut cols:      u16,
+    mut rows:      u16,
+    budget:        Duration,
+    stdout:        &mut io::Stdout,
+    input_rx:      std::sync::mpsc::Receiver<input::InputEvent>,
+    wayland_input: Option<WaylandInput>,
+    compositor:    &mut GuiCompositor,
 ) -> io::Result<()> {
-    let black = ColorCell { fg: [0, 0, 0], bg: [0, 0, 0] };
-    let mut prev = vec![black; cols as usize * rows as usize];
+    let make_black = || ColorCell { fg: [0, 0, 0], bg: [0, 0, 0] };
+    let mut prev = vec![make_black(); cols as usize * rows as usize];
 
     while alive.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
-        // Process any pending input events
-        while let Ok(ev) = input_rx.try_recv() {
-            let _ = input::handle_input_event(&ev);
+        if let Some((w, h)) = drain_input(&input_rx, alive, &wayland_input, cols, rows) {
+            cols = w; rows = h;
+            prev = vec![make_black(); cols as usize * rows as usize];
+            execute!(stdout, terminal::Clear(terminal::ClearType::All))?;
         }
+        if !alive.load(Ordering::SeqCst) { break; }
+        if !compositor.is_running() { break; }
 
-        let curr = capture();
+        let (w, h, rgba) = compositor.capture_rgba();
+        let curr = if w == 0 || h == 0 || rgba.is_empty() {
+            vec![make_black(); cols as usize * rows as usize]
+        } else {
+            rgba_to_halfblocks(&rgba, w, h, cols, rows)
+        };
 
         for row in 0..rows {
             let s = row as usize * cols as usize;
             let e = (s + cols as usize).min(curr.len());
             if e <= s || curr[s..e] == prev[s..e] { continue; }
-
             execute!(stdout, cursor::MoveTo(0, row))?;
             let mut line = String::with_capacity(cols as usize * 32);
             for cell in &curr[s..e] {
@@ -211,41 +234,50 @@ fn color_dirty_loop_with_input(
     Ok(())
 }
 
-// ── Colour render loop ────────────────────────────────────────────────────────
+// ── ASCII GUI loop (luma chars) ───────────────────────────────────────────────
 
-fn color_dirty_loop(
-    alive: &AtomicBool,
-    cols: u16,
-    rows: u16,
-    budget: Duration,
-    stdout: &mut io::Stdout,
-    mut capture: impl FnMut() -> Vec<ColorCell>,
+fn ascii_gui_loop(
+    alive:         &AtomicBool,
+    mut cols:      u16,
+    mut rows:      u16,
+    budget:        Duration,
+    stdout:        &mut io::Stdout,
+    input_rx:      std::sync::mpsc::Receiver<input::InputEvent>,
+    wayland_input: Option<WaylandInput>,
+    compositor:    &mut GuiCompositor,
+    edge:          bool,
 ) -> io::Result<()> {
-    let black = ColorCell { fg: [0, 0, 0], bg: [0, 0, 0] };
-    let mut prev = vec![black; cols as usize * rows as usize];
+    let mut prev = vec![' '; cols as usize * rows as usize];
 
     while alive.load(Ordering::SeqCst) {
         let tick = Instant::now();
-        let curr = capture();
+
+        if let Some((w, h)) = drain_input(&input_rx, alive, &wayland_input, cols, rows) {
+            cols = w; rows = h;
+            prev = vec![' '; cols as usize * rows as usize];
+            execute!(stdout, terminal::Clear(terminal::ClearType::All))?;
+        }
+        if !alive.load(Ordering::SeqCst) { break; }
+        if !compositor.is_running() { break; }
+
+        let (w, h, rgba) = compositor.capture_rgba();
+        let curr = if w == 0 || h == 0 || rgba.is_empty() {
+            vec![' '; cols as usize * rows as usize]
+        } else {
+            let luma = compute_luma(&rgba, w, h, cols, rows);
+            if edge {
+                luma_to_chars(&luma, cols, rows)
+            } else {
+                luma.iter().map(|&l| veil_render::luma_to_char(l)).collect()
+            }
+        };
 
         for row in 0..rows {
             let s = row as usize * cols as usize;
             let e = (s + cols as usize).min(curr.len());
             if e <= s || curr[s..e] == prev[s..e] { continue; }
-
             execute!(stdout, cursor::MoveTo(0, row))?;
-            let mut line = String::with_capacity(cols as usize * 32);
-            for cell in &curr[s..e] {
-                use std::fmt::Write as _;
-                let _ = write!(
-                    line,
-                    "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u{2580}",
-                    cell.fg[0], cell.fg[1], cell.fg[2],
-                    cell.bg[0], cell.bg[1], cell.bg[2],
-                );
-            }
-            line.push_str("\x1b[0m");
-            write!(stdout, "{line}")?;
+            write!(stdout, "{}", curr[s..e].iter().collect::<String>())?;
         }
         stdout.flush()?;
         prev = curr;
@@ -257,14 +289,86 @@ fn color_dirty_loop(
     Ok(())
 }
 
-// ── Shared render loop ────────────────────────────────────────────────────────
+// ── Kitty graphics protocol loop ─────────────────────────────────────────────
 
-/// Generic dirty-row render loop. `capture` is called each tick and must return
-/// exactly `cols * rows` chars. Only rows that changed since the last frame are redrawn.
+fn kitty_gui_loop(
+    alive:         &AtomicBool,
+    mut cols:      u16,
+    mut rows:      u16,
+    budget:        Duration,
+    stdout:        &mut io::Stdout,
+    input_rx:      std::sync::mpsc::Receiver<input::InputEvent>,
+    wayland_input: Option<WaylandInput>,
+    compositor:    &mut GuiCompositor,
+) -> io::Result<()> {
+    while alive.load(Ordering::SeqCst) {
+        let tick = Instant::now();
+
+        if let Some((w, h)) = drain_input(&input_rx, alive, &wayland_input, cols, rows) {
+            cols = w; rows = h;
+            // Clear kitty images on resize
+            execute!(stdout, terminal::Clear(terminal::ClearType::All))?;
+            write!(stdout, "\x1b_Ga=d,d=A,q=2\x1b\\")?;
+        }
+        if !alive.load(Ordering::SeqCst) { break; }
+        if !compositor.is_running() { break; }
+
+        let (w, h, rgba) = compositor.capture_rgba();
+        if w > 0 && h > 0 && !rgba.is_empty() {
+            let frame = render_kitty_frame(&rgba, w, h, cols, rows);
+            execute!(stdout, cursor::MoveTo(0, 0))?;
+            write!(stdout, "{frame}")?;
+            stdout.flush()?;
+        }
+
+        if let Some(rem) = budget.checked_sub(tick.elapsed()) {
+            thread::sleep(rem);
+        }
+    }
+
+    // Clean up images on exit
+    write!(stdout, "\x1b_Ga=d,d=A,q=2\x1b\\")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+// ── Shared input drain ────────────────────────────────────────────────────────
+
+/// Drain all pending input events. Returns Some((cols, rows)) if terminal was resized.
+/// Stores false into `alive` on Ctrl+C.
+fn drain_input(
+    input_rx:      &std::sync::mpsc::Receiver<input::InputEvent>,
+    alive:         &AtomicBool,
+    wayland_input: &Option<WaylandInput>,
+    cols:          u16,
+    rows:          u16,
+) -> Option<(u16, u16)> {
+    let mut resize = None;
+    while let Ok(ev) = input_rx.try_recv() {
+        if let input::InputEvent::Key(k) = &ev {
+            use crossterm::event::{KeyCode, KeyModifiers};
+            if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                alive.store(false, Ordering::SeqCst);
+                return resize;
+            }
+        }
+        if let Some(wi) = wayland_input {
+            if let Some(sz) = input::forward_event(&ev, wi, cols, rows) {
+                resize = Some(sz);
+            }
+        } else if let input::InputEvent::Resize(w, h) = ev {
+            resize = Some((w, h));
+        }
+    }
+    resize
+}
+
+// ── TUI render loop ───────────────────────────────────────────────────────────
+
 fn dirty_loop(
-    alive: &AtomicBool,
-    cols: u16,
-    rows: u16,
+    alive:  &AtomicBool,
+    cols:   u16,
+    rows:   u16,
     budget: Duration,
     stdout: &mut io::Stdout,
     mut capture: impl FnMut() -> Vec<char>,
@@ -296,9 +400,57 @@ fn dirty_loop(
 
 fn probe(cfg: veil_config::VeilConfig) -> io::Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    println!("terminal : {}", std::env::var("TERM").unwrap_or_else(|_| "unknown".into()));
-    println!("size     : {cols}x{rows}");
-    println!("quality  : {}", cfg.quality.as_str());
-    println!("fps      : {}", cfg.fps);
+    let resolved     = cfg.resolved_quality();
+    println!("terminal     : {}", std::env::var("TERM").unwrap_or_else(|_| "unknown".into()));
+    println!("colorterm    : {}", std::env::var("COLORTERM").unwrap_or_else(|_| "unknown".into()));
+    println!("size         : {cols}x{rows}");
+    println!("quality      : {} (resolved: {})", cfg.quality.as_str(), resolved.as_str());
+    println!("fps          : {}", cfg.fps);
+    println!("cage_timeout : {}s", cfg.cage_timeout_secs);
+    println!("input        : {}", cfg.input);
+    Ok(())
+}
+
+fn test_kitty() -> io::Result<()> {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    eprintln!("[test-kitty] terminal size: {}x{}", cols, rows);
+
+    // 200x100 RGBA test pattern: four quadrants R/G/B/W
+    let iw: u32 = 200;
+    let ih: u32 = 100;
+    let mut rgba = vec![0u8; (iw * ih * 4) as usize];
+    for y in 0..ih {
+        for x in 0..iw {
+            let off = ((y * iw + x) * 4) as usize;
+            let (r, g, b) = match (x < iw / 2, y < ih / 2) {
+                (true,  true)  => (220,  50,  50),  // red
+                (false, true)  => ( 50, 200,  50),  // green
+                (true,  false) => ( 50,  50, 220),  // blue
+                (false, false) => (200, 200, 200),  // white
+            };
+            rgba[off]     = r;
+            rgba[off + 1] = g;
+            rgba[off + 2] = b;
+            rgba[off + 3] = 255;
+        }
+    }
+
+    // Use half the terminal so text is visible before/after
+    let show_cols = cols;
+    let show_rows = rows / 2;
+
+    let frame = render_kitty_frame(&rgba, iw, ih, show_cols, show_rows);
+
+    let mut stdout = io::stdout();
+    writeln!(stdout, "=== veil test-kitty: image below, press Enter to exit ===")?;
+    write!(stdout, "{frame}")?;
+    // Move cursor below image area and print a marker
+    execute!(stdout, cursor::MoveTo(0, show_rows + 2))?;
+    writeln!(stdout, "=== end of image area ===")?;
+    stdout.flush()?;
+
+    // Wait for Enter
+    let mut buf = [0u8; 1];
+    io::stdin().read(&mut buf).ok();
     Ok(())
 }

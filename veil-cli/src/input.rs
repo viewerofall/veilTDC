@@ -1,274 +1,129 @@
-use crossterm::event::{self, Event, KeyEvent, KeyCode, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
-use std::io;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use std::{sync::mpsc, thread, time::Duration};
+use veil_compositor::{InputCmd, WaylandInput, evdev_keycode, keycodes, xkb_mod, btn};
 
-/// Raw input event from terminal/keyboard.
 #[derive(Debug, Clone)]
 pub enum InputEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Resize(u16, u16),
 }
 
-/// Spawn an input thread that reads terminal events and sends them over a channel.
-/// Returns an mpsc receiver for input events.
 pub fn spawn_input_thread() -> mpsc::Receiver<InputEvent> {
     let (tx, rx) = mpsc::channel();
-
     thread::spawn(move || {
-        let _ = enable_mouse_support();
         loop {
-            if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    let _ = tx.send(InputEvent::Key(key));
-                } else if let Ok(Event::Mouse(mouse)) = event::read() {
-                    let _ = tx.send(InputEvent::Mouse(mouse));
+            if event::poll(Duration::from_millis(16)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(k))        => { let _ = tx.send(InputEvent::Key(k)); }
+                    Ok(Event::Mouse(m))      => { let _ = tx.send(InputEvent::Mouse(m)); }
+                    Ok(Event::Resize(w, h))  => { let _ = tx.send(InputEvent::Resize(w, h)); }
+                    _                        => {}
                 }
             }
         }
     });
-
     rx
 }
 
-/// Enable mouse support (basic crossterm setup).
-fn enable_mouse_support() -> io::Result<()> {
-    crossterm::terminal::enable_raw_mode()?;
-    Ok(())
+/// XKB modifier bitmask from crossterm KeyModifiers.
+fn xkb_mods(m: KeyModifiers) -> u32 {
+    let mut bits: u32 = 0;
+    if m.contains(KeyModifiers::SHIFT)   { bits |= xkb_mod::SHIFT; }
+    if m.contains(KeyModifiers::CONTROL) { bits |= xkb_mod::CONTROL; }
+    if m.contains(KeyModifiers::ALT)     { bits |= xkb_mod::ALT; }
+    if m.contains(KeyModifiers::SUPER)   { bits |= xkb_mod::SUPER; }
+    bits
 }
 
-/// Serialize input event to a simple text format for passing to apps or portal.
-/// Format: "K:char:mods\n" or "M:button:x:y\n"
-pub fn serialize_input(ev: &InputEvent) -> String {
-    match ev {
-        InputEvent::Key(key) => {
-            format!("K:{:?}:{:?}\n", key.code, key.modifiers)
-        }
-        InputEvent::Mouse(mouse) => {
-            let button = match mouse.kind {
-                MouseEventKind::Down(b) => format!("{:?}", b),
-                MouseEventKind::Up(b) => format!("{:?}", b),
-                _ => "move".to_string(),
+/// Convert a crossterm KeyEvent to (keycode, modifier_bits). Returns None if unmappable.
+fn key_to_input(ev: &KeyEvent) -> Option<(u32, u32)> {
+    let (needs_shift, canonical) = match ev.code {
+        KeyCode::Char(c) if c.is_ascii_uppercase() =>
+            (true, KeyCode::Char(c.to_ascii_lowercase())),
+        KeyCode::Char(c @ ('!'|'@'|'#'|'$'|'%'|'^'|'&'|'*'|'('|')'|
+                            '_'|'+'|'{'|'}'|'|'|':'|'"'|'~'|'<'|'>'|'?')) => {
+            let unshifted = match c {
+                '!' => '1', '@' => '2', '#' => '3', '$' => '4', '%' => '5',
+                '^' => '6', '&' => '7', '*' => '8', '(' => '9', ')' => '0',
+                '_' => '-', '+' => '=', '{' => '[', '}' => ']', '|' => '\\',
+                ':' => ';', '"' => '\'', '~' => '`', '<' => ',', '>' => '.',
+                '?' => '/',  _ => c,
             };
-            format!("M:{}:{}:{}\n", button, mouse.column, mouse.row)
+            (true, KeyCode::Char(unshifted))
         }
-    }
-}
-
-// ── Portal D-Bus integration ───────────────────────────────────────────────
-
-/// Inject keyboard keysym via xdg-desktop-portal RemoteDesktop.
-/// Tries multiple backends and falls back to xdotool.
-pub fn inject_key_via_portal_blocking(keysym: u32, pressed: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-
-    // Try xdg-desktop-portal RemoteDesktop (GNOME/KDE path)
-    let sym_str = format!("{}", keysym);
-    let press_str = if pressed { "1" } else { "0" };
-
-    if let Ok(status) = Command::new("dbus-send")
-        .args(&[
-            "--session",
-            "--print-reply",
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.RemoteDesktop.InjectKeyboardKeysym",
-            &format!("uint32:{}", sym_str),
-            &format!("uint32:{}", press_str),
-        ])
-        .output()
-    {
-        if status.status.success() {
-            return Ok(());
-        }
-    }
-
-    // Fallback: try xdotool (XWayland)
-    let keysym_name = keysym_to_name(keysym);
-    if !keysym_name.is_empty() {
-        let action = if pressed { "keydown" } else { "keyup" };
-        if let Ok(status) = Command::new("xdotool")
-            .args(&[action, keysym_name])
-            .output()
-        {
-            if status.status.success() {
-                return Ok(());
-            }
-        }
-    }
-
-    // Fallback: use ydotool (Wayland-native)
-    if let Ok(status) = Command::new("ydotool")
-        .args(&["key", &if pressed {
-            format!("{}:1", keysym)
-        } else {
-            format!("{}:0", keysym)
-        }])
-        .output()
-    {
-        if status.status.success() {
-            return Ok(());
-        }
-    }
-
-    Err("All input injection methods failed".into())
-}
-
-/// Inject pointer button via xdg-desktop-portal RemoteDesktop.
-pub fn inject_pointer_button_blocking(button: i32, pressed: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use std::process::Command;
-
-    // Try portal first
-    let btn_str = format!("{}", button);
-    let press_str = if pressed { "1" } else { "0" };
-
-    if let Ok(status) = Command::new("dbus-send")
-        .args(&[
-            "--session",
-            "--print-reply",
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.RemoteDesktop.InjectPointerButton",
-            &format!("int32:{}", btn_str),
-            &format!("uint32:{}", press_str),
-        ])
-        .output()
-    {
-        if status.status.success() {
-            return Ok(());
-        }
-    }
-
-    // Fallback: xdotool
-    let btn_name = match button {
-        1 => "1",
-        3 => "3",
-        2 => "2",
-        _ => return Err(format!("Unknown button: {}", button).into()),
+        other => (false, other),
     };
 
-    if let Ok(status) = Command::new("xdotool")
-        .args(&[if pressed { "mousedown" } else { "mouseup" }, btn_name])
-        .output()
-    {
-        if status.status.success() {
-            return Ok(());
-        }
-    }
+    let keycode = match canonical {
+        KeyCode::Char(c) => evdev_keycode(c)?,
+        KeyCode::Backspace => keycodes::BACKSPACE,
+        KeyCode::Tab       => keycodes::TAB,
+        KeyCode::Enter     => keycodes::ENTER,
+        KeyCode::Esc       => keycodes::ESC,
+        KeyCode::Delete    => keycodes::DELETE,
+        KeyCode::Insert    => keycodes::INSERT,
+        KeyCode::Home      => keycodes::HOME,
+        KeyCode::End       => keycodes::END,
+        KeyCode::PageUp    => keycodes::PAGE_UP,
+        KeyCode::PageDown  => keycodes::PAGE_DOWN,
+        KeyCode::Left      => keycodes::LEFT,
+        KeyCode::Right     => keycodes::RIGHT,
+        KeyCode::Up        => keycodes::UP,
+        KeyCode::Down      => keycodes::DOWN,
+        KeyCode::F(n) if (1..=12).contains(&n) => keycodes::F[n as usize],
+        _ => return None,
+    };
 
-    Err("All pointer injection methods failed".into())
+    let mut mods = xkb_mods(ev.modifiers);
+    if needs_shift { mods |= xkb_mod::SHIFT; }
+    Some((keycode, mods))
 }
 
-/// Convert X11 keysym to xdotool key name.
-fn keysym_to_name(keysym: u32) -> &'static str {
-    match keysym {
-        32 => "space",
-        0xff08 => "BackSpace",
-        0xff09 => "Tab",
-        0xff0d => "Return",
-        0xff1b => "Escape",
-        0xff50 => "Home",
-        0xff57 => "End",
-        0xff55 => "Prior",
-        0xff56 => "Next",
-        0xff51 => "Left",
-        0xff53 => "Right",
-        0xff52 => "Up",
-        0xff54 => "Down",
-        0xffff => "Delete",
-        0xffbe..=0xffc9 => "F1", // Simplified - would need full mapping
-        _ => "",
-    }
-}
-
-/// Convert crossterm KeyCode to X11 keysym.
-fn keycode_to_keysym(code: KeyCode) -> Option<u32> {
-    match code {
-        KeyCode::Char(c) => {
-            let keysym = match c {
-                'a'..='z' | 'A'..='Z' | '0'..='9' => c as u32,
-                ' ' => 0xff80,  // space
-                '\n' => 0xff0d, // Return
-                '\t' => 0xff09, // Tab
-                _ => return None,
-            };
-            Some(keysym)
-        }
-        KeyCode::Backspace => Some(0xff08),
-        KeyCode::Enter => Some(0xff0d),
-        KeyCode::Tab => Some(0xff09),
-        KeyCode::Esc => Some(0xff1b),
-        KeyCode::Home => Some(0xff50),
-        KeyCode::End => Some(0xff57),
-        KeyCode::PageUp => Some(0xff55),
-        KeyCode::PageDown => Some(0xff56),
-        KeyCode::Left => Some(0xff51),
-        KeyCode::Right => Some(0xff53),
-        KeyCode::Up => Some(0xff52),
-        KeyCode::Down => Some(0xff54),
-        KeyCode::Delete => Some(0xffff),
-        KeyCode::F(n) if n <= 12 => Some(0xffbe + (n as u32 - 1)),
-        _ => None,
-    }
-}
-
-/// Convert crossterm MouseButton to xdg-desktop-portal button code (1=left, 2=middle, 3=right).
-fn mousebutton_to_portal(button: MouseButton) -> i32 {
-    match button {
-        MouseButton::Left => 1,
-        MouseButton::Right => 3,
-        MouseButton::Middle => 2,
-    }
-}
-
-/// Handle a single input event: inject via portal (spawned in background thread).
-pub fn handle_input_event(ev: &InputEvent) -> Option<()> {
+/// Forward a terminal input event into cage via WaylandInput.
+/// Returns Some((cols, rows)) if the terminal was resized.
+pub fn forward_event(ev: &InputEvent, input: &WaylandInput, cols: u16, rows: u16) -> Option<(u16, u16)> {
     match ev {
-        InputEvent::Key(key) => {
-            if let Some(keysym) = keycode_to_keysym(key.code) {
-                let pressed = !matches!(key.kind, crossterm::event::KeyEventKind::Release);
-                thread::spawn(move || {
-                    let _ = inject_key_via_portal_blocking(keysym, pressed);
-                });
+        InputEvent::Key(k) => {
+            if let Some((keycode, mods)) = key_to_input(k) {
+                use crossterm::event::KeyEventKind;
+                let pressed = k.kind != KeyEventKind::Release;
+                input.send(InputCmd::Key { keycode, mods, pressed });
             }
+            None
         }
-        InputEvent::Mouse(mouse) => {
-            if let MouseEventKind::Down(btn) | MouseEventKind::Up(btn) = mouse.kind {
-                let portal_btn = mousebutton_to_portal(btn);
-                let pressed = matches!(mouse.kind, MouseEventKind::Down(_));
-                thread::spawn(move || {
-                    let _ = inject_pointer_button_blocking(portal_btn, pressed);
-                });
+        InputEvent::Mouse(m) => {
+            // Always update pointer position first (matches texttop/browsh's "move before click" pattern).
+            // In halfblock mode each terminal row covers 2 source pixels — use rows*2 as height extent
+            // so the y coordinate maps to the correct cage pixel position.
+            input.send(InputCmd::PointerMotionAbs {
+                x:      m.column as u32,
+                y:      m.row as u32 * 2,
+                width:  cols as u32,
+                height: rows as u32 * 2,
+            });
+            match m.kind {
+                MouseEventKind::Down(b) => input.send(InputCmd::PointerButton {
+                    button: mouse_btn(b), pressed: true,
+                }),
+                MouseEventKind::Up(b) => input.send(InputCmd::PointerButton {
+                    button: mouse_btn(b), pressed: false,
+                }),
+                MouseEventKind::ScrollUp   => input.send(InputCmd::PointerAxisScroll { steps: -1 }),
+                MouseEventKind::ScrollDown => input.send(InputCmd::PointerAxisScroll { steps:  1 }),
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => {} // motion already sent above
+                _ => {}
             }
+            None
         }
+        InputEvent::Resize(w, h) => Some((*w, *h)),
     }
-    Some(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_serialize_key() {
-        let key = KeyEvent::new(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        );
-        let ev = InputEvent::Key(key);
-        let s = serialize_input(&ev);
-        assert!(s.contains("K:") && s.contains("NONE"));
-    }
-
-    #[test]
-    fn test_serialize_mouse() {
-        let mouse = MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 10,
-            row: 20,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        };
-        let ev = InputEvent::Mouse(mouse);
-        let s = serialize_input(&ev);
-        assert!(s.contains("M:") && s.contains("10") && s.contains("20"));
+fn mouse_btn(b: MouseButton) -> u32 {
+    match b {
+        MouseButton::Left   => btn::LEFT,
+        MouseButton::Right  => btn::RIGHT,
+        MouseButton::Middle => btn::MIDDLE,
     }
 }

@@ -9,6 +9,7 @@ portable-pty = { workspace = true }
 vt100        = { workspace = true }
 serde_json            = "1"
 libc                  = "0.2"
-wayland-client        = { workspace = true }
-wayland-protocols-wlr = { workspace = true }
-rustix                = { workspace = true }
+wayland-client         = { workspace = true }
+wayland-protocols-wlr  = { workspace = true }
+wayland-protocols-misc = { workspace = true }
+rustix                 = { workspace = true }

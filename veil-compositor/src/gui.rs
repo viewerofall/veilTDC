@@ -1,6 +1,5 @@
 use std::collections::HashSet;
-use std::os::unix::fs::FileTypeExt;
-use std::path::PathBuf;
+use std::fs::File;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -8,212 +7,89 @@ use std::time::{Duration, Instant};
 use veil_render::TextCell;
 use crate::wayland_capture::WaylandCapture;
 
+#[allow(dead_code)]
 const ATSPI_SCRIPT: &str = include_str!("../../atspi_query.py");
 
-/* ── Compositor detection ───────────────────────────────────────────────── */
+/* ── Wayland socket discovery via /proc ──────────────────────────────────── */
 
-#[derive(Clone, Copy, PartialEq)]
-enum CompositorKind { Niri, Hyprland, Unknown }
+/// Find the wayland-* socket that cage (cage_pid) is currently listening on.
+/// Reads /proc/<pid>/fd to get socket inodes, matches against /proc/net/unix.
+fn find_cage_socket(cage_pid: u32, runtime_dir: &str) -> Option<String> {
+    let fd_dir = format!("/proc/{}/fd", cage_pid);
+    let mut inodes: HashSet<u64> = HashSet::new();
 
-fn detect_compositor() -> CompositorKind {
-    if std::env::var("NIRI_SOCKET").is_ok() {
-        return CompositorKind::Niri;
-    }
-    if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() {
-        return CompositorKind::Hyprland;
-    }
-    CompositorKind::Unknown
-}
-
-/* ── Window info ─────────────────────────────────────────────────────────── */
-
-#[derive(Clone, Debug)]
-struct WindowInfo {
-    pid:    u32,
-    app_id: String,
-    title:  String,
-    x:      i32,
-    y:      i32,
-    w:      u32,
-    h:      u32,
-}
-
-fn list_niri_windows() -> Vec<WindowInfo> {
-    (|| -> Option<Vec<WindowInfo>> {
-        let out = Command::new("niri").args(["msg", "--json", "windows"]).output().ok()?;
-        let json: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
-        Some(
-            json.iter()
-                .filter_map(|w| {
-                    let pid    = w["pid"].as_u64()? as u32;
-                    let app_id = w["app_id"].as_str().unwrap_or("").to_string();
-                    let title  = w["title"].as_str().unwrap_or("").to_string();
-
-                    // Extract window size from layout
-                    let layout = &w["layout"];
-                    let window_size = layout["window_size"].as_array()?;
-                    let ww = window_size[0].as_i64()? as u32;
-                    let wh = window_size[1].as_i64()? as u32;
-
-                    if ww == 0 || wh == 0 { return None; }
-
-                    // For position: try to use tile_size and tile_pos, or default to 0,0
-                    // (Niri doesn't expose absolute screen coordinates easily)
-                    let tile_size = layout["tile_size"].as_array();
-                    let tile_pos = layout["tile_pos_in_workspace_view"].as_array();
-                    let offset = layout["window_offset_in_tile"].as_array();
-
-                    let (x, y) = if let (Some(ts), Some(tp), Some(off)) = (tile_size, tile_pos, offset) {
-                        let tile_w = ts[0].as_f64().unwrap_or(0.0) as i32;
-                        let tile_h = ts[1].as_f64().unwrap_or(0.0) as i32;
-                        let col = tp[0].as_i64().unwrap_or(0) as i32;
-                        let row = tp[1].as_i64().unwrap_or(0) as i32;
-                        let off_x = off[0].as_f64().unwrap_or(0.0) as i32;
-                        let off_y = off[1].as_f64().unwrap_or(0.0) as i32;
-                        (col * tile_w + off_x, row * tile_h + off_y)
-                    } else {
-                        (0, 0)
-                    };
-
-                    eprintln!("[window] {} (pid={}) size={}x{} pos={},{}", app_id, pid, ww, wh, x, y);
-                    Some(WindowInfo { pid, app_id, title, x, y, w: ww, h: wh })
-                })
-                .collect(),
-        )
-    })()
-    .unwrap_or_default()
-}
-
-fn list_hyprland_windows() -> Vec<WindowInfo> {
-    (|| -> Option<Vec<WindowInfo>> {
-        let out = Command::new("hyprctl").args(["clients", "-j"]).output().ok()?;
-        let json: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
-        Some(
-            json.iter()
-                .filter_map(|w| {
-                    if w["mapped"].as_bool() == Some(false) { return None; }
-                    let pid    = w["pid"].as_u64()? as u32;
-                    let app_id = w["class"].as_str().unwrap_or("").to_string();
-                    let title  = w["title"].as_str().unwrap_or("").to_string();
-                    let at     = w["at"].as_array()?;
-                    let size   = w["size"].as_array()?;
-                    let x  = at[0].as_i64().unwrap_or(0) as i32;
-                    let y  = at[1].as_i64().unwrap_or(0) as i32;
-                    let ww = size[0].as_u64()? as u32;
-                    let wh = size[1].as_u64()? as u32;
-                    if ww == 0 || wh == 0 { return None; }
-                    Some(WindowInfo { pid, app_id, title, x, y, w: ww, h: wh })
-                })
-                .collect(),
-        )
-    })()
-    .unwrap_or_default()
-}
-
-fn wayland_sockets() -> HashSet<String> {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
-    std::fs::read_dir(&dir).ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("wayland-")
-                && e.metadata().ok().map(|m| m.file_type().is_socket()).unwrap_or(false)
-            { Some(name) } else { None }
-        })
-        .collect()
-}
-
-fn wait_for_new_socket(existing: &HashSet<String>, timeout: Duration) -> Option<String> {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with("wayland-") && !existing.contains(&name) {
-                    if entry.metadata().ok().map(|m| m.file_type().is_socket()).unwrap_or(false) {
-                        return Some(name);
+    if let Ok(entries) = std::fs::read_dir(&fd_dir) {
+        for entry in entries.flatten() {
+            if let Ok(target) = std::fs::read_link(entry.path()) {
+                let s = target.to_string_lossy();
+                // Kernel renders socket fds as "socket:[inode]"
+                if let Some(rest) = s.strip_prefix("socket:[") {
+                    if let Some(inode_str) = rest.strip_suffix("]") {
+                        if let Ok(inode) = inode_str.parse::<u64>() {
+                            inodes.insert(inode);
+                        }
                     }
                 }
             }
         }
-        thread::sleep(Duration::from_millis(100));
     }
+
+    if inodes.is_empty() { return None; }
+
+    let prefix = format!("{}/wayland-", runtime_dir);
+    let data = std::fs::read_to_string("/proc/net/unix").ok()?;
+
+    for line in data.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 8 { continue; }
+        let inode: u64 = parts[6].parse().unwrap_or(0);
+        let path = parts[7];
+        if inodes.contains(&inode) && path.starts_with(&prefix) {
+            return Some(path.to_string());
+        }
+    }
+
     None
 }
 
-fn list_windows(kind: CompositorKind) -> Vec<WindowInfo> {
-    match kind {
-        CompositorKind::Niri     => list_niri_windows(),
-        CompositorKind::Hyprland => list_hyprland_windows(),
-        CompositorKind::Unknown  => Vec::new(),
-    }
-}
-
-fn snapshot_pids(kind: CompositorKind) -> HashSet<u32> {
-    list_windows(kind).into_iter().map(|w| w.pid).collect()
-}
-
-fn wait_for_new_window(
-    known:      &HashSet<u32>,
-    child_pid:  u32,
-    kind:       CompositorKind,
-    timeout:    Duration,
-) -> Option<WindowInfo> {
+/// Poll until cage has a wayland socket open, or timeout.
+fn wait_for_cage_socket(cage_pid: u32, runtime_dir: &str, timeout: Duration) -> Option<String> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        for w in list_windows(kind) {
-            if !known.contains(&w.pid) || is_pid_descendant(child_pid, w.pid) {
-                if w.w > 0 && w.h > 0 {
-                    return Some(w);
-                }
-            }
+        if let Some(path) = find_cage_socket(cage_pid, runtime_dir) {
+            return Some(path);
         }
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(50));
     }
     None
 }
 
-fn is_pid_descendant(parent: u32, candidate: u32) -> bool {
-    if candidate == parent { return true; }
-    let path = format!("/proc/{}/status", candidate);
-    let Ok(text) = std::fs::read_to_string(path) else { return false; };
-    text.lines()
-        .find(|l| l.starts_with("PPid:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u32>().ok())
-        .map(|ppid| ppid == parent)
-        .unwrap_or(false)
-}
+/* ── AT-SPI query ───────────────────────────────────────────────────────── */
 
-/* ── Sibling binary discovery ───────────────────────────────────────────── */
+#[derive(Clone)]
+#[allow(dead_code)]
+struct Geo { x: i32, y: i32, w: u32, h: u32 }
 
-fn find_sibling(name: &str) -> Option<PathBuf> {
-    // 1. Next to current exe — covers both dev (target/release/) and installed (/usr/local/bin/)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let c = dir.join(name);
-            if c.exists() { return Some(c); }
-        }
-    }
-    // 2. System lib dir for .so files (installed by `make install`)
-    let sys = PathBuf::from("/usr/local/lib/veil").join(name);
-    if sys.exists() { return Some(sys); }
-
-    // 3. User lib dir
-    if let Ok(home) = std::env::var("HOME") {
-        let user = PathBuf::from(home).join(".local/lib/veil").join(name);
-        if user.exists() { return Some(user); }
-    }
-    None
+#[allow(dead_code)]
+fn query_atspi(script: &std::path::Path, pid: u32, geo: &Geo, cols: u16, rows: u16) -> Option<Vec<TextCell>> {
+    let out = Command::new("python3").arg(script).arg(pid.to_string()).output().ok()?;
+    if out.stdout.is_empty() { return None; }
+    let json: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
+    let cells = json.iter().filter_map(|e| {
+        let text = e["text"].as_str()?.trim().to_string();
+        if text.is_empty() { return None; }
+        let tx = e["x"].as_i64()? as i32;
+        let ty = e["y"].as_i64()? as i32;
+        let col = ((tx - geo.x) * cols as i32 / geo.w.max(1) as i32).clamp(0, cols as i32 - 1) as u16;
+        let row = ((ty - geo.y) * rows as i32 / geo.h.max(1) as i32).clamp(0, rows as i32 - 1) as u16;
+        Some(TextCell { col, row, text })
+    }).collect();
+    Some(cells)
 }
 
 /* ── RGBA crop ──────────────────────────────────────────────────────────── */
 
-/// Crop a physical-pixel RGBA buffer to a logical-pixel window region.
-/// Returns (cropped_w, cropped_h, rgba) in physical pixels.
+#[allow(dead_code)]
 fn crop_rgba(src: &[u8], src_w: u32, src_h: u32,
              x: i32, y: i32, w: u32, h: u32, scale: i32) -> (u32, u32, Vec<u8>) {
     let s  = scale.max(1) as u32;
@@ -231,87 +107,69 @@ fn crop_rgba(src: &[u8], src_w: u32, src_h: u32,
     (pw, ph, out)
 }
 
-/* ── AT-SPI query ───────────────────────────────────────────────────────── */
-
-#[derive(Clone)]
-struct Geo { x: i32, y: i32, w: u32, h: u32 }
-
-fn query_atspi(script: &std::path::Path, pid: u32, geo: &Geo, cols: u16, rows: u16) -> Option<Vec<TextCell>> {
-    let out = Command::new("python3").arg(script).arg(pid.to_string()).output().ok()?;
-    if out.stdout.is_empty() { return None; }
-    let json: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
-    let cells = json.iter().filter_map(|e| {
-        let text = e["text"].as_str()?.trim().to_string();
-        if text.is_empty() { return None; }
-        let tx = e["x"].as_i64()? as i32;
-        let ty = e["y"].as_i64()? as i32;
-        let col = ((tx - geo.x) * cols as i32 / geo.w.max(1) as i32).clamp(0, cols as i32 - 1) as u16;
-        let row = ((ty - geo.y) * rows as i32 / geo.h.max(1) as i32).clamp(0, rows as i32 - 1) as u16;
-        Some(TextCell { col, row, text })
-    }).collect();
-    Some(cells)
-}
-
 /* ── GuiCompositor ──────────────────────────────────────────────────────── */
 
 pub struct GuiCompositor {
     child:       Child,
     latest_rgba: Arc<Mutex<(u32, u32, Vec<u8>)>>,
     latest_text: Arc<Mutex<Vec<TextCell>>>,
+    pub cage_socket: Option<String>,
 }
 
 impl GuiCompositor {
     pub fn launch(
-        app:            &str,
-        _cols:          u16,
-        _rows:          u16,
-        _window_timeout: Duration,
-        capture_fps:    u32,
+        app:          &str,
+        _cols:        u16,
+        _rows:        u16,
+        cage_timeout: Duration,
+        capture_fps:  u32,
     ) -> Self {
-        // Snapshot existing wayland sockets so we can detect cage's new one.
-        let existing_sockets = wayland_sockets();
-        eprintln!("[gui] existing sockets: {:?}", existing_sockets);
+        let cage_log_path = "/tmp/veil-cage.log";
+        let cage_log = File::create(cage_log_path)
+            .unwrap_or_else(|_| File::create("/dev/null").unwrap());
 
-        // Launch app inside cage (isolated Wayland compositor).
-        // cage creates its own zwlr_screencopy_manager_v1 — only the app is visible.
         let child = Command::new("cage")
             .arg("--")
             .arg(app)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(cage_log)
             .spawn()
             .unwrap_or_else(|e| panic!("failed to launch cage: {e}"));
         let cage_pid = child.id();
-        eprintln!("[gui] cage pid={}", cage_pid);
+        eprintln!("[gui] cage pid={} (log → {})", cage_pid, cage_log_path);
 
         let latest_rgba: Arc<Mutex<(u32, u32, Vec<u8>)>> =
             Arc::new(Mutex::new((0, 0, Vec::new())));
         let latest_text: Arc<Mutex<Vec<TextCell>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // ── Capture thread ────────────────────────────────────────────────
-        {
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+
+        // Discover cage's socket via /proc/<pid>/fd + /proc/net/unix.
+        // This avoids the stale-socket race where cage reuses a name that was
+        // in our "existing" set from a previous dead instance.
+        let cage_socket_path: Option<String> = match wait_for_cage_socket(cage_pid, &runtime_dir, cage_timeout) {
+            Some(path) => {
+                eprintln!("[gui] cage socket: {}", path);
+                thread::sleep(Duration::from_millis(200));
+                Some(path)
+            }
+            None => {
+                eprintln!("[gui] cage socket not found within {:?}", cage_timeout);
+                eprintln!("[gui] cage log: {}", cage_log_path);
+                if let Ok(log) = std::fs::read_to_string(cage_log_path) {
+                    for line in log.lines().filter(|l| l.contains("[ERROR]") || l.contains("Failed")) {
+                        eprintln!("[cage] {}", line);
+                    }
+                }
+                None
+            }
+        };
+
+        if let Some(socket_path) = cage_socket_path.clone() {
             let rgba_ref  = Arc::clone(&latest_rgba);
             let frame_dur = Duration::from_secs_f64(1.0 / capture_fps.max(1) as f64);
 
             thread::spawn(move || {
-                // Wait for cage's Wayland socket to appear
-                let runtime_dir =
-                    std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
-
-                let cage_socket = match wait_for_new_socket(&existing_sockets, Duration::from_secs(10)) {
-                    Some(s) => s,
-                    None => {
-                        eprintln!("[capture] cage socket never appeared — idling");
-                        loop { thread::sleep(Duration::from_millis(500)); }
-                    }
-                };
-
-                let socket_path = format!("{}/{}", runtime_dir, cage_socket);
-                eprintln!("[capture] cage socket: {}", socket_path);
-
-                // Give cage a moment to finish initializing its compositor
-                thread::sleep(Duration::from_millis(300));
-
                 match WaylandCapture::connect_to_socket(&socket_path) {
                     Some(mut wc) => {
                         eprintln!("[capture] screencopy connected to cage");
@@ -335,8 +193,7 @@ impl GuiCompositor {
             });
         }
 
-        thread::sleep(Duration::from_millis(200));
-        Self { child, latest_rgba, latest_text }
+        Self { child, latest_rgba, latest_text, cage_socket: cage_socket_path }
     }
 
     pub fn capture_rgba(&self) -> (u32, u32, Vec<u8>) {
@@ -355,13 +212,5 @@ impl GuiCompositor {
 impl Drop for GuiCompositor {
     fn drop(&mut self) {
         let _ = self.child.kill();
-    }
-}
-
-fn compositor_name(k: CompositorKind) -> &'static str {
-    match k {
-        CompositorKind::Niri     => "Niri",
-        CompositorKind::Hyprland => "Hyprland",
-        CompositorKind::Unknown  => "unknown",
     }
 }
