@@ -2,10 +2,13 @@
 //!
 //! v1 scope: single client, single fullscreen toplevel, shm buffers,
 //! keyboard + pointer + scroll, wl_output advertisement, xdg_activation
-//! stub. No popups, no subsurfaces, no dmabuf/EGL — clients that hard-
-//! require GPU (Chromium-based: helium-browser, Electron) won't render
-//! until linux-dmabuf-v1 + GBM are wired up. That's a separate effort.
+//! stub. dmabuf global is advertised but rejects all imports — clients
+//! that hard-require working GPU import (Chromium-based, Electron) still
+//! won't render until linux-dmabuf-v1 + GBM are wired up. The bind stub
+//! is just enough for toolkits to negotiate down to shm gracefully
+//! instead of bailing on bind failure.
 
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::process::{Command, Stdio};
@@ -20,42 +23,51 @@ use calloop::{
 };
 
 use smithay::{
-    delegate_compositor, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_activation, delegate_xdg_shell,
+    delegate_compositor, delegate_dmabuf, delegate_fractional_scale, delegate_output,
+    delegate_presentation, delegate_seat, delegate_shm, delegate_viewporter,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    desktop::{PopupKind, PopupManager},
     input::{
         keyboard::{FilterResult, KeyboardHandle, KeysymHandle, ModifiersState, XkbConfig},
         pointer::{
-            AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
+            AxisFrame, ButtonEvent, CursorImageAttributes, CursorImageStatus, MotionEvent,
+            PointerHandle,
         },
         Seat, SeatHandler, SeatState,
     },
     output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
     reexports::wayland_server::{
-        backend::{ClientData, ClientId, DisconnectReason},
+        backend::{ClientData, ClientId, DisconnectReason, ObjectId},
         protocol::{wl_buffer, wl_seat, wl_shm, wl_surface::WlSurface},
-        Client, Display,
+        Client, Display, Resource,
     },
     utils::{Serial, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
             with_states, with_surface_tree_downward, BufferAssignment,
-            CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-            TraversalAction,
+            CompositorClientState, CompositorHandler, CompositorState, SubsurfaceCachedState,
+            SurfaceAttributes, TraversalAction,
         },
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState},
         output::{OutputHandler, OutputManagerState},
+        presentation::PresentationState,
         selection::SelectionHandler,
         shell::xdg::{
+            decoration::{XdgDecorationHandler, XdgDecorationState},
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
         },
         shm::{with_buffer_contents, ShmHandler, ShmState},
+        viewporter::ViewporterState,
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
         },
         socket::ListeningSocketSource,
     },
-    xwayland::{XWayland, XWaylandEvent},
+    xwayland::{XWayland, XWaylandClientData, XWaylandEvent},
 };
+use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use crate::{input::InputCmd, sink::Frame};
@@ -69,6 +81,12 @@ pub struct State {
     pub seat_state:        SeatState<Self>,
     pub xdg_activation:    XdgActivationState,
     pub output_manager:    OutputManagerState,
+    pub dmabuf_state:      DmabufState,
+    pub _dmabuf_global:    DmabufGlobal,
+    pub _xdg_decoration:   XdgDecorationState,
+    pub _viewporter:       ViewporterState,
+    pub _fractional:       FractionalScaleManagerState,
+    pub _presentation:     PresentationState,
     pub seat:              Seat<Self>,
     pub keyboard:          KeyboardHandle<Self>,
     pub pointer:           PointerHandle<Self>,
@@ -79,10 +97,22 @@ pub struct State {
     /// location, so we keep track of it across button/scroll events.
     pub pointer_pos:       (f64, f64),
     pub toplevels:         Vec<ToplevelSurface>,
+    pub popups:            PopupManager,
+    pub surface_buffers:   HashMap<ObjectId, SurfaceBuf>,
+    pub cursor_status:     CursorImageStatus,
+    pub dirty:             bool,
+    pub last_composite:    Option<Instant>,
     pub frame_tx:          mpsc::Sender<Frame>,
     pub serial_counter:    u32,
     pub frame_serial:      u64,
     pub running:           bool,
+}
+
+/// Per-surface RGBA cache entry. We re-blit these every dirty tick.
+pub struct SurfaceBuf {
+    pub rgba: Vec<u8>,
+    pub w:    u32,
+    pub h:    u32,
 }
 
 impl State {
@@ -111,37 +141,62 @@ impl CompositorHandler for State {
     fn compositor_state(&mut self) -> &mut CompositorState { &mut self.compositor_state }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
+        // XWayland clients have their own client-data type. Try both.
+        if let Some(d) = client.get_data::<ClientState>() {
+            return &d.compositor_state;
+        }
+        if let Some(d) = client.get_data::<XWaylandClientData>() {
+            return &d.compositor_state;
+        }
+        panic!("client missing both ClientState and XWaylandClientData");
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        let buffer_opt = with_states(surface, |states| {
+        // Pull the newly-attached buffer (if any) and cache it as RGBA
+        // keyed by surface id. We re-composite from all caches on tick.
+        enum Assign { New(wl_buffer::WlBuffer), Removed, None }
+        let assign = with_states(surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
-            let attrs = guard.current();
-            match attrs.buffer.take() {
-                Some(BufferAssignment::NewBuffer(b)) => Some(b),
-                _ => None,
+            match guard.current().buffer.take() {
+                Some(BufferAssignment::NewBuffer(b)) => Assign::New(b),
+                Some(BufferAssignment::Removed)      => Assign::Removed,
+                None                                 => Assign::None,
             }
         });
 
-        if let Some(buffer) = buffer_opt {
-            let result = with_buffer_contents(&buffer, |ptr, len, data| {
-                let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
-                shm_to_rgba(raw, &data)
-            });
-
-            match result {
-                Ok(Some((rgba, w, h))) => {
-                    self.frame_serial = self.frame_serial.wrapping_add(1);
-                    let _ = self.frame_tx.send(Frame {
-                        rgba, width: w, height: h, serial: self.frame_serial,
-                    });
+        match assign {
+            Assign::New(buffer) => {
+                let result = with_buffer_contents(&buffer, |ptr, len, data| {
+                    let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+                    shm_to_rgba(raw, &data)
+                });
+                if let Ok(Some((rgba, w, h))) = result {
+                    self.surface_buffers.insert(
+                        surface.id(),
+                        SurfaceBuf { rgba, w, h },
+                    );
+                    self.dirty = true;
                 }
-                Ok(None) => tracing::trace!("commit: unsupported buffer format"),
-                Err(e)   => tracing::trace!("commit: buffer access error: {e:?}"),
+                buffer.release();
             }
+            Assign::Removed => {
+                self.surface_buffers.remove(&surface.id());
+                self.dirty = true;
+            }
+            Assign::None => {
+                // Pure state commit (geometry, role config). Still mark
+                // dirty so subsurface-offset changes get re-composited.
+                self.dirty = true;
+            }
+        }
 
-            buffer.release();
+        // Let PopupManager update its internal book-keeping.
+        self.popups.commit(surface);
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
+        if self.surface_buffers.remove(&surface.id()).is_some() {
+            self.dirty = true;
         }
     }
 }
@@ -154,10 +209,13 @@ impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState { &mut self.xdg_shell_state }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Tell the client our viewport size but DON'T force Fullscreen —
+        // weston-terminal, thunar and friends gate input/decoration on
+        // !Fullscreen. We still composite at (0,0); the client can pick
+        // whatever size it wants up to this bound.
         let size = (self.output_w as i32, self.output_h as i32);
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
-            state.states.set(xdg_toplevel::State::Fullscreen);
             state.size = Some(size.into());
         });
         surface.send_configure();
@@ -170,7 +228,15 @@ impl XdgShellHandler for State {
         self.toplevels.push(surface);
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        surface.with_pending_state(|s| {
+            s.geometry = positioner.get_geometry();
+            s.positioner = positioner;
+        });
+        if let Err(e) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!("track_popup failed: {e:?}");
+        }
+    }
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
     fn reposition_request(&mut self, _s: PopupSurface, _p: PositionerState, _t: u32) {}
 }
@@ -182,7 +248,10 @@ impl SeatHandler for State {
 
     fn seat_state(&mut self) -> &mut SeatState<Self> { &mut self.seat_state }
     fn focus_changed(&mut self, _s: &Seat<Self>, _f: Option<&WlSurface>) {}
-    fn cursor_image(&mut self, _s: &Seat<Self>, _i: CursorImageStatus) {}
+    fn cursor_image(&mut self, _s: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_status = image;
+        self.dirty = true;
+    }
 }
 
 impl SelectionHandler for State {
@@ -190,6 +259,48 @@ impl SelectionHandler for State {
 }
 
 impl OutputHandler for State {}
+
+impl DmabufHandler for State {
+    fn dmabuf_state(&mut self) -> &mut DmabufState { &mut self.dmabuf_state }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        // No GPU import path yet — fail every dmabuf so the client falls
+        // back to shm. The global existing at all is what unblocks
+        // Chromium-class apps that bail on bind failure.
+        notifier.failed();
+    }
+}
+
+impl XdgDecorationHandler for State {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        // We don't draw decorations; ask client to do it itself.
+        toplevel.with_pending_state(|s| {
+            s.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        });
+        toplevel.send_configure();
+    }
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: zxdg_toplevel_decoration_v1::Mode) {
+        toplevel.with_pending_state(|s| {
+            s.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        });
+        toplevel.send_configure();
+    }
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|s| {
+            s.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
+impl FractionalScaleHandler for State {
+    fn new_fractional_scale(&mut self, _surface: WlSurface) {}
+}
 
 impl XdgActivationHandler for State {
     fn activation_state(&mut self) -> &mut XdgActivationState { &mut self.xdg_activation }
@@ -213,6 +324,11 @@ delegate_xdg_shell!(State);
 delegate_seat!(State);
 delegate_output!(State);
 delegate_xdg_activation!(State);
+delegate_dmabuf!(State);
+delegate_xdg_decoration!(State);
+delegate_viewporter!(State);
+delegate_fractional_scale!(State);
+delegate_presentation!(State);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -238,6 +354,176 @@ fn shm_to_rgba(raw: &[u8], data: &smithay::wayland::shm::BufferData) -> Option<(
     Some((out, w as u32, h as u32))
 }
 
+/// Alpha-over blit `src` onto `back` at `(x, y)`. Clips to back bounds.
+fn blit(back: &mut [u8], back_w: u32, back_h: u32, src: &SurfaceBuf, x: i32, y: i32) {
+    let bw = back_w as i32;
+    let bh = back_h as i32;
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + src.w as i32).min(bw);
+    let y1 = (y + src.h as i32).min(bh);
+    if x0 >= x1 || y0 >= y1 { return; }
+    for dy in y0..y1 {
+        let sy = (dy - y) as u32;
+        let drow = (dy as u32 * back_w * 4) as usize;
+        let srow = (sy * src.w * 4) as usize;
+        for dx in x0..x1 {
+            let sx  = (dx - x) as u32;
+            let di  = drow + (dx as u32 * 4) as usize;
+            let si  = srow + (sx * 4) as usize;
+            let a   = src.rgba[si + 3] as u32;
+            if a == 255 {
+                back[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
+            } else if a > 0 {
+                let inv = 255 - a;
+                back[di]     = ((src.rgba[si]     as u32 * a + back[di]     as u32 * inv) / 255) as u8;
+                back[di + 1] = ((src.rgba[si + 1] as u32 * a + back[di + 1] as u32 * inv) / 255) as u8;
+                back[di + 2] = ((src.rgba[si + 2] as u32 * a + back[di + 2] as u32 * inv) / 255) as u8;
+                back[di + 3] = 255;
+            }
+        }
+    }
+}
+
+/// 12×16 white-on-black arrow. '#' = white opaque, '.' = black opaque,
+/// ' ' = transparent. Hotspot at (0, 0) = top-left, matching X11 default.
+const ARROW: &[&[u8; 12]; 16] = &[
+    b"#           ",
+    b"##          ",
+    b"#.#         ",
+    b"#..#        ",
+    b"#...#       ",
+    b"#....#      ",
+    b"#.....#     ",
+    b"#......#    ",
+    b"#.......#   ",
+    b"#........#  ",
+    b"#.....#####.",
+    b"#..#..#     ",
+    b"#.# #..#    ",
+    b"##  #..#    ",
+    b"#    #..#   ",
+    b"     ####   ",
+];
+
+fn draw_fallback_cursor(back: &mut [u8], back_w: u32, back_h: u32, x: i32, y: i32) {
+    for (dy, row) in ARROW.iter().enumerate() {
+        let py = y + dy as i32;
+        if py < 0 || py as u32 >= back_h { continue; }
+        for (dx, &ch) in row.iter().enumerate() {
+            let px = x + dx as i32;
+            if px < 0 || px as u32 >= back_w { continue; }
+            let rgb = match ch {
+                b'#' => Some([255u8, 255, 255]),
+                b'.' => Some([0u8, 0, 0]),
+                _    => None,
+            };
+            if let Some(c) = rgb {
+                let i = ((py as u32 * back_w + px as u32) * 4) as usize;
+                back[i]     = c[0];
+                back[i + 1] = c[1];
+                back[i + 2] = c[2];
+                back[i + 3] = 255;
+            }
+        }
+    }
+}
+
+/// Walk `root`'s surface tree, blitting each surface's cached buffer
+/// into `back` at its accumulated subsurface offset (added to `origin`).
+fn blit_subtree(
+    back:   &mut [u8],
+    back_w: u32,
+    back_h: u32,
+    cache:  &HashMap<ObjectId, SurfaceBuf>,
+    root:   &WlSurface,
+    origin: (i32, i32),
+) {
+    with_surface_tree_downward(
+        root,
+        origin,
+        |surface, states, &parent_origin: &(i32, i32)| {
+            // Root has no SubsurfaceCachedState; its offset is (0,0).
+            // Children are positioned at parent_origin + subsurface.location.
+            let here = if surface == root {
+                parent_origin
+            } else {
+                let mut g = states.cached_state.get::<SubsurfaceCachedState>();
+                let loc = g.current().location;
+                (parent_origin.0 + loc.x, parent_origin.1 + loc.y)
+            };
+            if let Some(buf) = cache.get(&surface.id()) {
+                blit(back, back_w, back_h, buf, here.0, here.1);
+            }
+            TraversalAction::DoChildren(here)
+        },
+        |_, _, _| {},
+        |_, _, _| true,
+    );
+}
+
+/// Composite all live toplevels + their popups + the cursor into a single
+/// RGBA frame and ship it. Called from the periodic tick when `dirty`.
+fn composite_and_send(state: &mut State) {
+    if !state.dirty { return; }
+    // Throttle to ~30 fps. Composition+encode+stdout is the bottleneck;
+    // pointer motion at terminal rate (>100 Hz) would queue frames faster
+    // than the renderer thread can drain them.
+    let now = Instant::now();
+    if let Some(t) = state.last_composite {
+        if now.duration_since(t) < Duration::from_millis(33) { return; }
+    }
+    state.last_composite = Some(now);
+    state.dirty = false;
+
+    let w = state.output_w;
+    let h = state.output_h;
+    let mut back = vec![0u8; (w as usize) * (h as usize) * 4];
+
+    // Toplevels (root buffer + subsurfaces) then their popups.
+    let toplevels: Vec<WlSurface> = state.toplevels.iter()
+        .filter(|t| t.alive())
+        .map(|t| t.wl_surface().clone())
+        .collect();
+    for surf in &toplevels {
+        blit_subtree(&mut back, w, h, &state.surface_buffers, surf, (0, 0));
+        for (popup, off) in PopupManager::popups_for_surface(surf) {
+            let ps = popup.wl_surface().clone();
+            blit_subtree(&mut back, w, h, &state.surface_buffers, &ps, (off.x, off.y));
+        }
+    }
+
+    // Cursor on top.
+    match &state.cursor_status {
+        CursorImageStatus::Surface(cs) => {
+            let hotspot = with_states(cs, |s| {
+                s.data_map.get::<std::sync::Mutex<CursorImageAttributes>>()
+                    .map(|m| m.lock().unwrap().hotspot)
+                    .unwrap_or_default()
+            });
+            let cx = state.pointer_pos.0 as i32 - hotspot.x;
+            let cy = state.pointer_pos.1 as i32 - hotspot.y;
+            blit_subtree(&mut back, w, h, &state.surface_buffers, cs, (cx, cy));
+        }
+        CursorImageStatus::Named(_) => {
+            // Client wants a themed cursor (default arrow etc) — we don't
+            // load themes. Draw a tiny built-in arrow so the user can see
+            // where their pointer is.
+            draw_fallback_cursor(
+                &mut back, w, h,
+                state.pointer_pos.0 as i32,
+                state.pointer_pos.1 as i32,
+            );
+        }
+        CursorImageStatus::Hidden => {}
+    }
+
+    state.frame_serial = state.frame_serial.wrapping_add(1);
+    let _ = state.frame_tx.send(Frame {
+        rgba: back, width: w, height: h, serial: state.frame_serial,
+    });
+}
+
 fn send_frame_callbacks(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
         surface,
@@ -251,6 +537,44 @@ fn send_frame_callbacks(surface: &WlSurface, time: u32) {
         },
         |_, _, &()| true,
     );
+}
+
+/// Walk all toplevels' popups (newest first) then the toplevel root.
+/// Return the first surface whose cached buffer rect contains (x, y),
+/// along with the cursor's surface-local coordinates.
+fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)> {
+    let xi = x as i32;
+    let yi = y as i32;
+
+    for top in state.toplevels.iter().rev() {
+        if !top.alive() { continue; }
+        let root = top.wl_surface().clone();
+
+        // Popups (per-toplevel) — last-added wins on overlap.
+        let popups: Vec<_> = PopupManager::popups_for_surface(&root).collect();
+        for (popup, off) in popups.iter().rev() {
+            let ps = popup.wl_surface();
+            if let Some(buf) = state.surface_buffers.get(&ps.id()) {
+                let bx = off.x;
+                let by = off.y;
+                if xi >= bx && yi >= by
+                    && xi < bx + buf.w as i32 && yi < by + buf.h as i32
+                {
+                    return Some((ps.clone(), (x - bx as f64, y - by as f64).into()));
+                }
+            }
+        }
+
+        // Toplevel root (subsurfaces share its keyboard/pointer focus via the root).
+        if let Some(buf) = state.surface_buffers.get(&root.id()) {
+            if xi >= 0 && yi >= 0
+                && xi < buf.w as i32 && yi < buf.h as i32
+            {
+                return Some((root, (x, y).into()));
+            }
+        }
+    }
+    None
 }
 
 fn apply_input(state: &mut State, cmd: InputCmd) {
@@ -274,9 +598,11 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let nx = if width  > 0 { x as f64 * state.output_w as f64 / width  as f64 } else { x as f64 };
             let ny = if height > 0 { y as f64 * state.output_h as f64 / height as f64 } else { y as f64 };
             state.pointer_pos = (nx, ny);
+            state.dirty = true;
 
-            let focus = state.toplevels.first()
-                .map(|t| (t.wl_surface().clone(), (0.0_f64, 0.0_f64).into()));
+            // Resolve focus: prefer the topmost popup under the cursor,
+            // else the toplevel. Surface-local coords are (global - origin).
+            let focus = pick_focus(state, nx, ny);
             let ptr = state.pointer.clone();
             ptr.motion(state, focus, &MotionEvent {
                 location: (nx, ny).into(), serial, time,
@@ -286,6 +612,12 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
 
         InputCmd::PointerButton { button, pressed } => {
             let bs = if pressed { BState::Pressed } else { BState::Released };
+            let focus = state.pointer.current_focus();
+            tracing::info!(
+                "button 0x{:x} pressed={} pos=({:.0},{:.0}) focus={:?}",
+                button, pressed, state.pointer_pos.0, state.pointer_pos.1,
+                focus.as_ref().map(|s| s.id()),
+            );
             let ptr = state.pointer.clone();
             ptr.button(state, &ButtonEvent { button, state: bs, serial, time });
             ptr.frame(state);
@@ -332,6 +664,16 @@ pub fn run(
     let xdg_shell_state  = XdgShellState::new::<State>(&dh);
     let xdg_activation   = XdgActivationState::new::<State>(&dh);
     let output_manager   = OutputManagerState::new_with_xdg_output::<State>(&dh);
+    // Stub dmabuf: advertise the global with zero supported formats. Apps that
+    // probe linux-dmabuf-v1 see the global; every Params::create attempt fails
+    // via ImportNotifier::failed(), pushing them to shm fallback.
+    let mut dmabuf_state = DmabufState::new();
+    let _dmabuf_global   = dmabuf_state.create_global::<State>(&dh, std::iter::empty());
+    let _xdg_decoration  = XdgDecorationState::new::<State>(&dh);
+    let _viewporter      = ViewporterState::new::<State>(&dh);
+    let _fractional      = FractionalScaleManagerState::new::<State>(&dh);
+    // clk_id 1 = CLOCK_MONOTONIC.
+    let _presentation    = PresentationState::new::<State>(&dh, 1);
     let mut seat_state   = SeatState::<State>::new();
     let mut seat         = seat_state.new_wl_seat(&dh, "veil-seat");
     let keyboard = seat
@@ -356,11 +698,18 @@ pub fn run(
     let state = State {
         compositor_state, xdg_shell_state, shm_state, seat_state,
         xdg_activation, output_manager,
+        dmabuf_state, _dmabuf_global,
+        _xdg_decoration, _viewporter, _fractional, _presentation,
         seat, keyboard, pointer,
         output,
         output_w: width, output_h: height,
         pointer_pos: (0.0, 0.0),
         toplevels: Vec::new(),
+        popups:           PopupManager::default(),
+        surface_buffers:  HashMap::new(),
+        cursor_status:    CursorImageStatus::default_named(),
+        dirty:            false,
+        last_composite:   None,
         frame_tx,
         serial_counter: 0,
         frame_serial:   0,
@@ -438,13 +787,21 @@ pub fn run(
             apply_input(&mut data.state, cmd);
         }
 
-        // Send frame callbacks for live toplevels.
+        // Composite all dirty surfaces into one RGBA frame and ship it.
+        composite_and_send(&mut data.state);
+
+        // Send frame callbacks for live toplevels (and their popups).
         let time = start.elapsed().as_millis() as u32;
         let surfaces: Vec<WlSurface> = data.state.toplevels.iter()
             .filter(|t| t.alive())
             .map(|t| t.wl_surface().clone())
             .collect();
-        for s in &surfaces { send_frame_callbacks(s, time); }
+        for s in &surfaces {
+            send_frame_callbacks(s, time);
+            for (popup, _) in PopupManager::popups_for_surface(s) {
+                send_frame_callbacks(popup.wl_surface(), time);
+            }
+        }
 
         // Flush outgoing wayland messages.
         let _ = data.display.flush_clients();

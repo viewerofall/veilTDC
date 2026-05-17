@@ -109,32 +109,51 @@ fn main() -> std::io::Result<()> {
         let input_tx  = host.input_sender();
         let (cw, ch)  = (comp_w, comp_h);
         std::thread::spawn(move || {
+            eprintln!("[veil-host] input thread started");
+            let mut tick = 0u32;
             while running.load(Ordering::Relaxed) {
-                if !event::poll(Duration::from_millis(100)).unwrap_or(false) { continue; }
-                let Ok(ev) = event::read() else { continue };
-                match ev {
-                    Event::Key(k) if is_ctrl_c(&k) => {
-                        eprintln!("[veil-host] ctrl-c → shutdown");
-                        running.store(false, Ordering::Relaxed);
-                        host_stop.store(true, Ordering::Relaxed);
-                        break;
+                match event::poll(Duration::from_millis(100)) {
+                    Ok(true)  => {}
+                    Ok(false) => {
+                        tick = tick.wrapping_add(1);
+                        if tick % 50 == 0 { eprintln!("[veil-host] input idle ({}s)", tick / 10); }
+                        continue;
                     }
-                    Event::Key(k) => forward_key(&input_tx, k),
-                    Event::Mouse(m) => forward_mouse(&input_tx, m, cols, rows, cw, ch),
-                    _ => {}
+                    Err(e) => { eprintln!("[veil-host] poll error: {e}"); continue; }
+                }
+                match event::read() {
+                    Ok(ev) => {
+                        eprintln!("[veil-host] event: {ev:?}");
+                        match ev {
+                            Event::Key(k) if is_ctrl_c(&k) => {
+                                eprintln!("[veil-host] ctrl-c → shutdown");
+                                running.store(false, Ordering::Relaxed);
+                                host_stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            Event::Key(k) => forward_key(&input_tx, k),
+                            Event::Mouse(m) => forward_mouse(&input_tx, m, cols, rows, cw, ch),
+                            _ => {}
+                        }
+                    }
+                    Err(e) => eprintln!("[veil-host] read error: {e}"),
                 }
             }
+            eprintln!("[veil-host] input thread exited");
         });
     }
 
     // ── frame loop ────────────────────────────────────────────────────────────
     let usable_rows = rows.saturating_sub(1);
     while running.load(Ordering::Relaxed) {
-        let frame = match host.frames().recv_timeout(Duration::from_millis(200)) {
+        let mut frame = match host.frames().recv_timeout(Duration::from_millis(200)) {
             Ok(f) => f,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        // Drain the channel — if the compositor produced multiple frames
+        // while we were encoding/writing the previous one, skip to latest.
+        while let Ok(f) = host.frames().try_recv() { frame = f; }
 
         let out = match mode {
             RenderMode::Kitty => {
