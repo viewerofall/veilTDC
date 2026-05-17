@@ -1,6 +1,6 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::{sync::mpsc, thread, time::Duration};
-use veil_compositor::{InputCmd, WaylandInput, evdev_keycode, keycodes, xkb_mod, btn};
+use veil_compositor::{InputCmd, evdev_keycode, keycodes, xkb_mod, btn};
 
 #[derive(Debug, Clone)]
 pub enum InputEvent {
@@ -80,38 +80,35 @@ fn key_to_input(ev: &KeyEvent) -> Option<(u32, u32)> {
     Some((keycode, mods))
 }
 
-/// Forward a terminal input event into cage via WaylandInput.
+/// Forward a terminal input event into cage via any input backend.
 /// Returns Some((cols, rows)) if the terminal was resized.
-pub fn forward_event(ev: &InputEvent, input: &WaylandInput, cols: u16, rows: u16) -> Option<(u16, u16)> {
+pub fn forward_event(ev: &InputEvent, send: &dyn Fn(InputCmd), cols: u16, rows: u16) -> Option<(u16, u16)> {
     match ev {
         InputEvent::Key(k) => {
             if let Some((keycode, mods)) = key_to_input(k) {
                 use crossterm::event::KeyEventKind;
                 let pressed = k.kind != KeyEventKind::Release;
-                input.send(InputCmd::Key { keycode, mods, pressed });
+                send(InputCmd::Key { keycode, mods, pressed });
             }
             None
         }
         InputEvent::Mouse(m) => {
-            // Always update pointer position first (matches texttop/browsh's "move before click" pattern).
-            // In halfblock mode each terminal row covers 2 source pixels — use rows*2 as height extent
-            // so the y coordinate maps to the correct cage pixel position.
-            input.send(InputCmd::PointerMotionAbs {
+            send(InputCmd::PointerMotionAbs {
                 x:      m.column as u32,
                 y:      m.row as u32 * 2,
                 width:  cols as u32,
                 height: rows as u32 * 2,
             });
             match m.kind {
-                MouseEventKind::Down(b) => input.send(InputCmd::PointerButton {
+                MouseEventKind::Down(b) => send(InputCmd::PointerButton {
                     button: mouse_btn(b), pressed: true,
                 }),
-                MouseEventKind::Up(b) => input.send(InputCmd::PointerButton {
+                MouseEventKind::Up(b) => send(InputCmd::PointerButton {
                     button: mouse_btn(b), pressed: false,
                 }),
-                MouseEventKind::ScrollUp   => input.send(InputCmd::PointerAxisScroll { steps: -1 }),
-                MouseEventKind::ScrollDown => input.send(InputCmd::PointerAxisScroll { steps:  1 }),
-                MouseEventKind::Moved | MouseEventKind::Drag(_) => {} // motion already sent above
+                MouseEventKind::ScrollUp   => send(InputCmd::PointerAxisScroll { steps: -1 }),
+                MouseEventKind::ScrollDown => send(InputCmd::PointerAxisScroll { steps:  1 }),
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => {}
                 _ => {}
             }
             None

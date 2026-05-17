@@ -1,5 +1,5 @@
 [workspace]
-members = ["veil-cli", "veil-compositor", "veil-render", "veil-config"]
+members = ["veil-cli", "veil-compositor", "veil-render", "veil-config", "veil-host"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -14,3 +14,9 @@ wayland-client        = "0.31"
 wayland-protocols-wlr  = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 rustix                = { version = "1", features = ["mm", "fs"] }
+evdev                 = "0.13"
+libc                  = "0.2"
+flate2                = "1.1"
+smithay               = { version = "0.7", default-features = false, features = ["wayland_frontend", "xwayland"] }
+calloop               = "0.14"
+tracing               = "0.1"

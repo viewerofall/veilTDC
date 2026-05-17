@@ -1,0 +1,24 @@
+[package]
+name    = "veil-host"
+version = "0.1.0"
+edition = "2021"
+
+# Nested headless Wayland compositor. Hosts one client, exposes its own
+# WAYLAND_DISPLAY socket. Runs alongside any other compositor (or none).
+
+[lib]
+
+[[bin]]
+name = "veil-host"
+path = "src/main.rs"
+
+[dependencies]
+smithay            = { workspace = true }
+calloop            = { workspace = true }
+tracing            = { workspace = true }
+veil-render        = { path = "../veil-render" }
+crossterm          = { workspace = true }
+libc               = { workspace = true }
+wayland-protocols  = { version = "0.32", features = ["server"] }
+wayland-server     = "0.31"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

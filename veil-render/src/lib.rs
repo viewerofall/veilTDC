@@ -1,4 +1,6 @@
+use flate2::{write::ZlibEncoder, Compression};
 use image::{imageops, DynamicImage, RgbaImage};
+use std::io::Write as _;
 
 /* ── Half-block colour renderer ──────────────────────────────────────────── */
 
@@ -187,37 +189,60 @@ pub fn apply_text_overlay(chars: &mut [char], text: &[TextCell], cols: u16) {
 /// Returns a single string: delete-previous + full new frame.
 ///
 /// Protocol: `ESC_G<params>;<b64>ESC\`  (APC, not OSC)
+/// Delete the persistent image ID used by render_kitty_frame.
+/// Call on resize and exit — not between frames.
+pub const KITTY_DELETE: &str = "\x1b_Ga=d,d=i,i=1,q=2\x1b\\";
+
 pub fn render_kitty_frame(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -> String {
-    const CLEAR: &str = "\x1b_Ga=d,d=a,q=2\x1b\\";
     const CHUNK: usize = 4096;
+    // Cap pixel dimensions so the base64 payload stays small enough to
+    // transmit without mid-sequence flicker through the PTY buffer.
+    const MAX_W: u32 = 960;
+    const MAX_H: u32 = 540;
 
-    // Downsample: 1 pixel per col, 2 pixels per row (matches halfblock parity)
-    let dst_w = cols as u32;
-    let dst_h = rows as u32 * 2;
+    if rgba.is_empty() || src_w == 0 || src_h == 0 { return String::new(); }
 
-    let img = match RgbaImage::from_raw(src_w, src_h, rgba.to_vec()) {
-        Some(i) => i,
-        None    => return CLEAR.to_string(),
+    let (iw, ih, buf);
+    if src_w > MAX_W || src_h > MAX_H {
+        let img = match RgbaImage::from_raw(src_w, src_h, rgba.to_vec()) {
+            Some(i) => i,
+            None    => return String::new(),
+        };
+        let scaled = DynamicImage::ImageRgba8(img)
+            .resize(MAX_W, MAX_H, imageops::FilterType::Triangle)
+            .to_rgba8();
+        let dims = scaled.dimensions();
+        iw  = dims.0;
+        ih  = dims.1;
+        buf = scaled.into_raw();
+    } else {
+        iw  = src_w;
+        ih  = src_h;
+        buf = rgba.to_vec();
+    }
+
+    // Zlib-compress before base64 — typical UI content compresses 4-6x,
+    // bringing 1.5MB frames down to ~300KB and making real-time feasible.
+    let compressed = {
+        let mut enc = ZlibEncoder::new(Vec::with_capacity(buf.len() / 4), Compression::fast());
+        let _ = enc.write_all(&buf);
+        enc.finish().unwrap_or(buf)
     };
-    let resized = DynamicImage::ImageRgba8(img)
-        .resize_exact(dst_w, dst_h, imageops::FilterType::Triangle)
-        .to_rgba8();
 
-    let b64 = base64_encode(resized.as_raw());
+    let b64 = base64_encode(&compressed);
     let b64_bytes = b64.as_bytes();
     let num_chunks = (b64_bytes.len() + CHUNK - 1).max(1) / CHUNK;
-    let mut out = String::with_capacity(CLEAR.len() + b64.len() + num_chunks * 80);
-
-    out.push_str(CLEAR);
+    let mut out = String::with_capacity(b64.len() + num_chunks * 80);
 
     for (i, chunk) in b64_bytes.chunks(CHUNK).enumerate() {
         let s    = std::str::from_utf8(chunk).unwrap_or("");
         let more = if i + 1 < num_chunks { 1 } else { 0 };
         if i == 0 {
             use std::fmt::Write as _;
+            // o=z: zlib payload  i=1,p=1: stable IDs for atomic in-place update
             let _ = write!(
                 out,
-                "\x1b_Ga=T,f=32,s={dst_w},v={dst_h},c={cols},r={rows},q=2,m={more};{s}\x1b\\"
+                "\x1b_Ga=T,f=32,o=z,i=1,p=1,s={iw},v={ih},c={cols},r={rows},q=2,m={more};{s}\x1b\\"
             );
         } else {
             use std::fmt::Write as _;

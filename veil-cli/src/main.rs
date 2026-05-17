@@ -9,9 +9,40 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use veil_compositor::{GuiCompositor, TermCompositor, WaylandInput};
+use veil_compositor::{GuiCompositor, TermCompositor, WaylandInput, UInputHandle, InputCmd};
 use veil_config::{load as load_config, Quality};
-use veil_render::{compute_luma, luma_to_chars, render_chars, render_kitty_frame, rgba_to_halfblocks, ColorCell};
+use veil_render::{compute_luma, luma_to_chars, render_chars, render_kitty_frame, rgba_to_halfblocks, ColorCell, KITTY_DELETE};
+
+/* ── Debug logging ───────────────────────────────────────────────────────── */
+
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// Verbose log — only emits when -d/--debug is active.
+/// All eprintln! (including from crates) goes to /tmp/veil.log via stderr dup2.
+macro_rules! vlog {
+    ($($arg:tt)*) => {
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    }
+}
+
+fn init_debug_log() {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::IntoRawFd;
+    let file = OpenOptions::new()
+        .write(true).create(true).truncate(true)
+        .open("/tmp/veil.log")
+        .expect("cannot open /tmp/veil.log");
+    let fd = file.into_raw_fd();
+    unsafe {
+        libc::dup2(fd, 2); // redirect stderr → /tmp/veil.log
+        libc::close(fd);
+    }
+    eprintln!("=== veil debug log ===");
+}
+
+/* ── CLI ─────────────────────────────────────────────────────────────────── */
 
 #[derive(Parser)]
 #[command(name = "veil", about = "Terminal display compositor — any app, any terminal")]
@@ -23,6 +54,10 @@ struct Cli {
     /// Override config values, e.g. --override fps=60,quality=pixel
     #[arg(long = "override", value_delimiter = ',', value_name = "KEY=VALUE")]
     overrides: Vec<String>,
+
+    /// Write verbose debug log to /tmp/veil.log
+    #[arg(short = 'd', long)]
+    debug: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -47,7 +82,14 @@ fn default_config_path() -> PathBuf {
 }
 
 fn main() -> io::Result<()> {
-    let cli         = Cli::parse();
+    let cli = Cli::parse();
+
+    if cli.debug {
+        DEBUG.store(true, Ordering::Relaxed);
+        init_debug_log();
+        eprintln!("[veil] debug mode — full log at /tmp/veil.log");
+    }
+
     let config_path = cli.config.unwrap_or_else(default_config_path);
     let mut cfg     = load_config(&config_path);
 
@@ -62,6 +104,9 @@ fn main() -> io::Result<()> {
             }
         }
     }
+
+    vlog!("[veil] config: quality={} fps={} cage_timeout={}s input={}",
+        cfg.quality.as_str(), cfg.fps, cfg.cage_timeout_secs, cfg.input);
 
     match cli.command {
         Command::Run       { app } => run_tui(app, cfg),
@@ -114,6 +159,22 @@ fn run_tui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
     result
 }
 
+// ── Input abstraction ─────────────────────────────────────────────────────────
+
+enum AnyInput {
+    Wayland(WaylandInput),
+    UInput(UInputHandle),
+}
+
+impl AnyInput {
+    fn send(&self, cmd: InputCmd) {
+        match self {
+            AnyInput::Wayland(w) => w.send(cmd),
+            AnyInput::UInput(u)  => u.send(cmd),
+        }
+    }
+}
+
 // ── GUI ───────────────────────────────────────────────────────────────────────
 
 fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
@@ -130,13 +191,17 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
         capture_fps,
     );
 
-    let wayland_input = if cfg.input {
-        let wi = compositor.cage_socket.as_deref()
-            .and_then(WaylandInput::connect_to_socket);
-        if wi.is_none() {
-            eprintln!("[input] virtual input unavailable — keyboard/mouse injection disabled");
+    let any_input: Option<AnyInput> = if cfg.input {
+        if let Some(wi) = compositor.cage_socket.as_deref().and_then(WaylandInput::connect_to_socket) {
+            eprintln!("[input] using Wayland virtual keyboard/pointer");
+            Some(AnyInput::Wayland(wi))
+        } else if let Some(ui) = UInputHandle::new() {
+            eprintln!("[input] using uinput virtual device");
+            Some(AnyInput::UInput(ui))
+        } else {
+            eprintln!("[input] all input methods failed — read-only mode");
+            None
         }
-        wi
     } else {
         eprintln!("[input] disabled by config");
         None
@@ -153,19 +218,19 @@ fn run_gui(app: String, cfg: veil_config::VeilConfig) -> io::Result<()> {
         Quality::AsciiLuma | Quality::AsciiEdge => {
             let edge = quality == Quality::AsciiEdge;
             ascii_gui_loop(&alive, cols, rows, budget, &mut stdout,
-                input_rx, wayland_input, &mut compositor, edge)
+                input_rx, any_input, &mut compositor, edge)
         }
         Quality::Kitty => {
             kitty_gui_loop(&alive, cols, rows, budget, &mut stdout,
-                input_rx, wayland_input, &mut compositor)
+                input_rx, any_input, &mut compositor)
         }
         Quality::Sixel => {
             eprintln!("[render] sixel not yet implemented, falling back to pixel");
             pixel_gui_loop(&alive, cols, rows, budget, &mut stdout,
-                input_rx, wayland_input, &mut compositor)
+                input_rx, any_input, &mut compositor)
         }
         _ => pixel_gui_loop(&alive, cols, rows, budget, &mut stdout,
-                input_rx, wayland_input, &mut compositor),
+                input_rx, any_input, &mut compositor),
     };
 
     let _ = execute!(stdout, LeaveAlternateScreen, cursor::Show);
@@ -182,7 +247,7 @@ fn pixel_gui_loop(
     budget:        Duration,
     stdout:        &mut io::Stdout,
     input_rx:      std::sync::mpsc::Receiver<input::InputEvent>,
-    wayland_input: Option<WaylandInput>,
+    any_input: Option<AnyInput>,
     compositor:    &mut GuiCompositor,
 ) -> io::Result<()> {
     let make_black = || ColorCell { fg: [0, 0, 0], bg: [0, 0, 0] };
@@ -191,7 +256,7 @@ fn pixel_gui_loop(
     while alive.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
-        if let Some((w, h)) = drain_input(&input_rx, alive, &wayland_input, cols, rows) {
+        if let Some((w, h)) = drain_input(&input_rx, alive, &any_input, cols, rows) {
             cols = w; rows = h;
             prev = vec![make_black(); cols as usize * rows as usize];
             execute!(stdout, terminal::Clear(terminal::ClearType::All))?;
@@ -200,6 +265,7 @@ fn pixel_gui_loop(
         if !compositor.is_running() { break; }
 
         let (w, h, rgba) = compositor.capture_rgba();
+        vlog!("[pixel] capture: {}x{} {} bytes", w, h, rgba.len());
         let curr = if w == 0 || h == 0 || rgba.is_empty() {
             vec![make_black(); cols as usize * rows as usize]
         } else {
@@ -243,7 +309,7 @@ fn ascii_gui_loop(
     budget:        Duration,
     stdout:        &mut io::Stdout,
     input_rx:      std::sync::mpsc::Receiver<input::InputEvent>,
-    wayland_input: Option<WaylandInput>,
+    any_input: Option<AnyInput>,
     compositor:    &mut GuiCompositor,
     edge:          bool,
 ) -> io::Result<()> {
@@ -252,7 +318,7 @@ fn ascii_gui_loop(
     while alive.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
-        if let Some((w, h)) = drain_input(&input_rx, alive, &wayland_input, cols, rows) {
+        if let Some((w, h)) = drain_input(&input_rx, alive, &any_input, cols, rows) {
             cols = w; rows = h;
             prev = vec![' '; cols as usize * rows as usize];
             execute!(stdout, terminal::Clear(terminal::ClearType::All))?;
@@ -298,27 +364,42 @@ fn kitty_gui_loop(
     budget:        Duration,
     stdout:        &mut io::Stdout,
     input_rx:      std::sync::mpsc::Receiver<input::InputEvent>,
-    wayland_input: Option<WaylandInput>,
+    any_input: Option<AnyInput>,
     compositor:    &mut GuiCompositor,
 ) -> io::Result<()> {
+    let mut frame_count: u64 = 0;
+    let mut empty_count: u64 = 0;
+
     while alive.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
-        if let Some((w, h)) = drain_input(&input_rx, alive, &wayland_input, cols, rows) {
+        if let Some((w, h)) = drain_input(&input_rx, alive, &any_input, cols, rows) {
             cols = w; rows = h;
-            // Clear kitty images on resize
+            vlog!("[kitty] resize → {}x{}", cols, rows);
+            write!(stdout, "{KITTY_DELETE}")?;
             execute!(stdout, terminal::Clear(terminal::ClearType::All))?;
-            write!(stdout, "\x1b_Ga=d,d=A,q=2\x1b\\")?;
         }
         if !alive.load(Ordering::SeqCst) { break; }
-        if !compositor.is_running() { break; }
+        if !compositor.is_running() {
+            vlog!("[kitty] compositor exited — leaving loop");
+            break;
+        }
 
         let (w, h, rgba) = compositor.capture_rgba();
-        if w > 0 && h > 0 && !rgba.is_empty() {
-            let frame = render_kitty_frame(&rgba, w, h, cols, rows);
+        vlog!("[kitty] capture: {}x{} {} bytes", w, h, rgba.len());
+
+        let frame = render_kitty_frame(&rgba, w, h, cols, rows);
+        if !frame.is_empty() {
+            frame_count += 1;
+            vlog!("[kitty] frame #{} payload={} bytes", frame_count, frame.len());
             execute!(stdout, cursor::MoveTo(0, 0))?;
             write!(stdout, "{frame}")?;
             stdout.flush()?;
+        } else {
+            empty_count += 1;
+            if empty_count <= 5 || empty_count % 60 == 0 {
+                vlog!("[kitty] empty frame #{} (no data yet)", empty_count);
+            }
         }
 
         if let Some(rem) = budget.checked_sub(tick.elapsed()) {
@@ -326,8 +407,8 @@ fn kitty_gui_loop(
         }
     }
 
-    // Clean up images on exit
-    write!(stdout, "\x1b_Ga=d,d=A,q=2\x1b\\")?;
+    vlog!("[kitty] loop ended: {} frames rendered, {} empty", frame_count, empty_count);
+    write!(stdout, "{KITTY_DELETE}")?;
     stdout.flush()?;
     Ok(())
 }
@@ -339,7 +420,7 @@ fn kitty_gui_loop(
 fn drain_input(
     input_rx:      &std::sync::mpsc::Receiver<input::InputEvent>,
     alive:         &AtomicBool,
-    wayland_input: &Option<WaylandInput>,
+    any_input: &Option<AnyInput>,
     cols:          u16,
     rows:          u16,
 ) -> Option<(u16, u16)> {
@@ -352,8 +433,8 @@ fn drain_input(
                 return resize;
             }
         }
-        if let Some(wi) = wayland_input {
-            if let Some(sz) = input::forward_event(&ev, wi, cols, rows) {
+        if let Some(ai) = any_input {
+            if let Some(sz) = input::forward_event(&ev, &|cmd| ai.send(cmd), cols, rows) {
                 resize = Some(sz);
             }
         } else if let input::InputEvent::Resize(w, h) = ev {

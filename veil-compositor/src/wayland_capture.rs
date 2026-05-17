@@ -73,7 +73,6 @@ impl Drop for ShmAlloc {
 
 /* ── Per-frame pending state ─────────────────────────────────────────────── */
 
-#[allow(dead_code)]
 struct PendingFrame {
     alloc:  ShmAlloc,
     pool:   WlShmPool,
@@ -81,6 +80,7 @@ struct PendingFrame {
     width:  u32,
     height: u32,
     stride: u32,
+    format: wl_shm::Format,
 }
 
 /* ── Client state ────────────────────────────────────────────────────────── */
@@ -133,7 +133,14 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureState {
         use zwlr_screencopy_frame_v1::Event;
         match ev {
             Event::Buffer { format, width, height, stride } => {
-                if format != WEnum::Value(wl_shm::Format::Xrgb8888) { return; }
+                let fmt = match format { WEnum::Value(f) => f, WEnum::Unknown(_) => return };
+                let ok = matches!(fmt,
+                    wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888 | wl_shm::Format::Xbgr8888 | wl_shm::Format::Abgr8888
+                );
+                if !ok {
+                    eprintln!("[wayland_capture] unsupported buffer format {:?}, skipping", fmt);
+                    return;
+                }
                 if state.pending.is_some() { return; }
 
                 let Some(shm) = &state.shm else { return };
@@ -143,11 +150,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureState {
                 let pool   = shm.create_pool(alloc.fd.as_fd(), len as i32, qh, ());
                 let wl_buf = pool.create_buffer(
                     0, width as i32, height as i32, stride as i32,
-                    wl_shm::Format::Xrgb8888, qh, (),
+                    fmt, qh, (),
                 );
                 frame.copy(&wl_buf);
 
-                state.pending = Some(PendingFrame { alloc, pool, wl_buf, width, height, stride });
+                state.pending = Some(PendingFrame { alloc, pool, wl_buf, width, height, stride, format: fmt });
+            }
+            Event::BufferDone => {
+                // v2+: all buffer format offers sent. If nothing was usable, fail.
+                if state.pending.is_none() {
+                    eprintln!("[wayland_capture] buffer_done with no usable format — failing frame");
+                    state.frame_failed = true;
+                }
             }
             Event::Ready { .. } => {
                 state.frame_ready = true;
@@ -297,12 +311,11 @@ impl WaylandCapture {
 
         let pf = self.state.pending.take()?;
         let raw = pf.alloc.data().to_vec();
+        let fmt = pf.format;
         pf.wl_buf.destroy();
         pf.pool.destroy();
 
-        // XRGB8888 LE: bytes are [B, G, R, X] → convert to [R, G, B, 255]
-        let rgba = xrgb_to_rgba(&raw);
-        Some((pf.width, pf.height, rgba))
+        Some((pf.width, pf.height, to_rgba(&raw, fmt)))
     }
 
     /// Capture the full target output.
@@ -326,21 +339,28 @@ impl WaylandCapture {
 
         let pf = self.state.pending.take()?;
         let raw = pf.alloc.data().to_vec();
+        let fmt = pf.format;
         pf.wl_buf.destroy();
         pf.pool.destroy();
 
-        let rgba = xrgb_to_rgba(&raw);
-        Some((pf.width, pf.height, rgba))
+        Some((pf.width, pf.height, to_rgba(&raw, fmt)))
     }
 }
 
-fn xrgb_to_rgba(src: &[u8]) -> Vec<u8> {
+fn to_rgba(src: &[u8], format: wl_shm::Format) -> Vec<u8> {
     let mut out = Vec::with_capacity(src.len());
-    for chunk in src.chunks_exact(4) {
-        out.push(chunk[2]); // R
-        out.push(chunk[1]); // G
-        out.push(chunk[0]); // B
-        out.push(0xFF);     // A
+    for c in src.chunks_exact(4) {
+        // All formats in LE memory:
+        //   Xrgb8888 / Argb8888: [B, G, R, _]
+        //   Xbgr8888 / Abgr8888: [R, G, B, _]
+        let (r, g, b) = match format {
+            wl_shm::Format::Xbgr8888 | wl_shm::Format::Abgr8888 => (c[0], c[1], c[2]),
+            _ => (c[2], c[1], c[0]),
+        };
+        out.push(r);
+        out.push(g);
+        out.push(b);
+        out.push(0xFF);
     }
     out
 }

@@ -188,7 +188,11 @@ pub struct WaylandInput {
 
 impl WaylandInput {
     pub fn connect_to_socket(socket_path: &str) -> Option<Self> {
-        let keymap = get_host_keymap()?;
+        let keymap = match get_host_keymap() {
+            Some(k) => k,
+            None => { eprintln!("[input] get_host_keymap failed (no seat/keyboard on host compositor)"); return None; }
+        };
+        eprintln!("[input] keymap acquired ({} bytes)", keymap.len());
 
         let stream = UnixStream::connect(socket_path).ok()?;
         let conn   = Connection::from_socket(stream).ok()?;
@@ -198,6 +202,9 @@ impl WaylandInput {
         let mut state = VInputState { seat: None, vk_manager: None, vp_manager: None };
         conn.display().get_registry(&qh, ());
         eq.roundtrip(&mut state).ok()?;
+
+        eprintln!("[input] cage globals: seat={} virtual_keyboard={} virtual_pointer={}",
+            state.seat.is_some(), state.vk_manager.is_some(), state.vp_manager.is_some());
 
         let seat       = state.seat.take()?;
         let vk_manager = state.vk_manager.take()?;
