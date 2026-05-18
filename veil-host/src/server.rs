@@ -1,12 +1,9 @@
 //! Smithay-based nested compositor: socket, globals, dispatch loop.
 //!
-//! v1 scope: single client, single fullscreen toplevel, shm buffers,
-//! keyboard + pointer + scroll, wl_output advertisement, xdg_activation
-//! stub. dmabuf global is advertised but rejects all imports — clients
-//! that hard-require working GPU import (Chromium-based, Electron) still
-//! won't render until linux-dmabuf-v1 + GBM are wired up. The bind stub
-//! is just enough for toolkits to negotiate down to shm gracefully
-//! instead of bailing on bind failure.
+//! v1 scope: single client, single fullscreen toplevel, shm + dmabuf buffers,
+//! keyboard + pointer + scroll, wl_output advertisement, xdg_activation stub.
+//! dmabuf: single-plane linear ARGB/XRGB/ABGR/XBGR 8888 accepted via mmap;
+//! tiled/compressed modifiers fall back to shm gracefully.
 
 use std::collections::HashMap;
 use std::io;
@@ -23,8 +20,11 @@ use calloop::{
 };
 
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
-    delegate_output, delegate_presentation, delegate_seat, delegate_shm, delegate_viewporter,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
+    delegate_fractional_scale, delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit,
+    delegate_output, delegate_pointer_constraints, delegate_presentation,
+    delegate_primary_selection, delegate_relative_pointer, delegate_tablet_manager,
+    delegate_seat, delegate_shm, delegate_text_input_manager, delegate_viewporter,
     delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
@@ -41,7 +41,7 @@ use smithay::{
         protocol::{wl_buffer, wl_seat, wl_shm, wl_surface::WlSurface},
         Client, Display, DisplayHandle, Resource,
     },
-    utils::{Serial, Transform},
+    utils::{Logical, Point, Serial, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -49,7 +49,10 @@ use smithay::{
             CompositorClientState, CompositorHandler, CompositorState, SubsurfaceCachedState,
             SurfaceAttributes, TraversalAction,
         },
-        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        dmabuf::{
+            get_dmabuf, DmabufFeedback, DmabufFeedbackBuilder,
+            DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+        },
         fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState},
         output::{OutputHandler, OutputManagerState},
         presentation::PresentationState,
@@ -62,7 +65,18 @@ use smithay::{
             decoration::{XdgDecorationHandler, XdgDecorationState},
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
         },
+        cursor_shape::CursorShapeManagerState,
+        idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
+        tablet_manager::{TabletManagerState, TabletSeatHandler},
+        keyboard_shortcuts_inhibit::{
+            KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
+            KeyboardShortcutsInhibitor,
+        },
+        pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
+        relative_pointer::RelativePointerManagerState,
+        selection::primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
         shm::{with_buffer_contents, ShmHandler, ShmState},
+        text_input::{TextInputManagerState, TextInputSeat},
         viewporter::ViewporterState,
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
@@ -73,6 +87,11 @@ use smithay::{
 };
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
+
+use smithay::backend::allocator::{
+    Buffer as AllocBuffer, Fourcc, Modifier,
+    dmabuf::{Dmabuf, DmabufMappingMode},
+};
 
 use crate::{input::InputCmd, sink::Frame};
 
@@ -88,10 +107,18 @@ pub struct State {
     pub dmabuf_state:      DmabufState,
     pub _dmabuf_global:    DmabufGlobal,
     pub _data_device:      DataDeviceState,
-    pub _xdg_decoration:   XdgDecorationState,
-    pub _viewporter:       ViewporterState,
-    pub _fractional:       FractionalScaleManagerState,
-    pub _presentation:     PresentationState,
+    pub _xdg_decoration:        XdgDecorationState,
+    pub _viewporter:            ViewporterState,
+    pub _fractional:            FractionalScaleManagerState,
+    pub _presentation:          PresentationState,
+    pub _text_input:            TextInputManagerState,
+    pub _primary_sel:           PrimarySelectionState,
+    pub _cursor_shape:          CursorShapeManagerState,
+    pub _pointer_constraints:   PointerConstraintsState,
+    pub _relative_pointer:      RelativePointerManagerState,
+    pub _idle_inhibit:          IdleInhibitManagerState,
+    pub _kb_inhibit:            KeyboardShortcutsInhibitState,
+    pub _tablet:                TabletManagerState,
     pub seat:              Seat<Self>,
     pub keyboard:          KeyboardHandle<Self>,
     pub pointer:           PointerHandle<Self>,
@@ -179,22 +206,26 @@ impl CompositorHandler for State {
 
         match assign {
             Assign::New(buffer) => {
-                let result = with_buffer_contents(&buffer, |ptr, len, data| {
-                    tracing::info!("commit {} buf {}x{} fmt={:?}", surface.id(), data.width, data.height, data.format);
+                // Try shm first, then dmabuf (linear mmap path).
+                let imported = with_buffer_contents(&buffer, |ptr, len, data| {
+                    tracing::info!("commit {} shm {}x{} fmt={:?}", surface.id(), data.width, data.height, data.format);
                     let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
                     shm_to_rgba(raw, &data)
+                })
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    let dmabuf = get_dmabuf(&buffer).ok()?;
+                    tracing::info!("commit {} dma {}x{} fmt={:?}", surface.id(), dmabuf.width(), dmabuf.height(), dmabuf.format().code);
+                    import_dmabuf(dmabuf)
                 });
-                match &result {
-                    Ok(None) => tracing::warn!("commit {} buf UNSUPPORTED FORMAT — skipping surface_buffers insert", surface.id()),
-                    Err(e)   => tracing::warn!("commit {} buf error: {:?}", surface.id(), e),
-                    Ok(Some((_, w, h))) => tracing::info!("commit {} → surface_buffers {}x{}", surface.id(), w, h),
-                }
-                if let Ok(Some((rgba, w, h))) = result {
-                    self.surface_buffers.insert(
-                        surface.id(),
-                        SurfaceBuf { rgba, w, h },
-                    );
+
+                if let Some((rgba, w, h)) = imported {
+                    tracing::info!("commit {} → surface_buffers {}x{}", surface.id(), w, h);
+                    self.surface_buffers.insert(surface.id(), SurfaceBuf { rgba, w, h });
                     self.dirty = true;
+                } else {
+                    tracing::warn!("commit {} — unsupported buffer type, skipping", surface.id());
                 }
                 buffer.release();
             }
@@ -269,6 +300,8 @@ impl SeatHandler for State {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let client = focused.and_then(|s| s.client());
         set_data_device_focus::<State>(&self.display_handle, seat, client);
+        // Text input focus tracks keyboard focus — required for Chromium text fields.
+        seat.text_input().set_focus(focused.cloned());
     }
     fn cursor_image(&mut self, _s: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
@@ -308,19 +341,61 @@ impl ServerDndGrabHandler for State {}
 
 impl OutputHandler for State {}
 
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&self) -> &PrimarySelectionState { &self._primary_sel }
+}
+
+impl PointerConstraintsHandler for State {
+    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
+    fn cursor_position_hint(&mut self, _: &WlSurface, _: &PointerHandle<Self>, _: Point<f64, Logical>) {}
+}
+
+impl IdleInhibitHandler for State {
+    fn inhibit(&mut self, _surface: WlSurface) {}
+    fn uninhibit(&mut self, _surface: WlSurface) {}
+}
+
+impl TabletSeatHandler for State {}
+
+impl KeyboardShortcutsInhibitHandler for State {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self._kb_inhibit
+    }
+    // Always grant inhibition — we have no keyboard shortcuts of our own to protect.
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        inhibitor.activate();
+    }
+}
+
 impl DmabufHandler for State {
     fn dmabuf_state(&mut self) -> &mut DmabufState { &mut self.dmabuf_state }
 
     fn dmabuf_imported(
         &mut self,
         _global: &DmabufGlobal,
-        _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // No GPU import path yet — fail every dmabuf so the client falls
-        // back to shm. The global existing at all is what unblocks
-        // Chromium-class apps that bail on bind failure.
-        notifier.failed();
+        // Accept single-plane linear dmabufs in supported formats.
+        // Actual pixel import happens in commit() via map_plane + mmap.
+        if dmabuf.num_planes() != 1 {
+            notifier.failed();
+            return;
+        }
+        let fmt = dmabuf.format();
+        // Only linear (or unspecified) modifier — tiled/compressed layouts
+        // can't be mmapped directly without a GPU decompression pass.
+        if fmt.modifier != Modifier::Linear && fmt.modifier != Modifier::Invalid {
+            notifier.failed();
+            return;
+        }
+        match fmt.code {
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 |
+            Fourcc::Abgr8888 | Fourcc::Xbgr8888 => {
+                let _ = notifier.successful::<State>();
+            }
+            _ => notifier.failed(),
+        }
     }
 }
 
@@ -367,8 +442,16 @@ impl XdgActivationHandler for State {
 }
 
 delegate_compositor!(State);
+delegate_cursor_shape!(State);
 delegate_data_device!(State);
+delegate_idle_inhibit!(State);
+delegate_keyboard_shortcuts_inhibit!(State);
+delegate_pointer_constraints!(State);
+delegate_primary_selection!(State);
+delegate_relative_pointer!(State);
 delegate_shm!(State);
+delegate_tablet_manager!(State);
+delegate_text_input_manager!(State);
 delegate_xdg_shell!(State);
 delegate_seat!(State);
 delegate_output!(State);
@@ -380,6 +463,76 @@ delegate_fractional_scale!(State);
 delegate_presentation!(State);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Build the default dmabuf feedback advertised to clients via linux-dmabuf-v4.
+///
+/// We claim the first accessible DRM render node as the main device and
+/// advertise only single-plane linear formats — the formats our map_plane
+/// mmap path can actually import. Chromium reads this feedback and allocates
+/// DRM_FORMAT_MOD_LINEAR buffers, which we can then mmap without any GPU
+/// decompression pass.
+fn build_dmabuf_feedback() -> DmabufFeedback {
+    use std::os::unix::fs::MetadataExt;
+    use smithay::backend::allocator::Format;
+
+    // Walk render nodes to find the first accessible one. dev_t tells
+    // Chromium which GPU device to allocate on (must match the node it opens).
+    let dev_t: libc::dev_t = (128..=135u32)
+        .map(|n| format!("/dev/dri/renderD{n}"))
+        .find_map(|path| std::fs::metadata(&path).ok().map(|m| m.rdev()))
+        .unwrap_or(0);
+
+    if dev_t == 0 {
+        eprintln!("[veil-host] dmabuf: no DRM render node found, feedback dev_t=0");
+    } else {
+        eprintln!("[veil-host] dmabuf feedback: dev_t={dev_t:#x} (renderD{})", (dev_t & 0xFF));
+    }
+
+    let formats = [
+        Format { code: Fourcc::Argb8888, modifier: Modifier::Linear },
+        Format { code: Fourcc::Xrgb8888, modifier: Modifier::Linear },
+        Format { code: Fourcc::Abgr8888, modifier: Modifier::Linear },
+        Format { code: Fourcc::Xbgr8888, modifier: Modifier::Linear },
+    ];
+
+    DmabufFeedbackBuilder::new(dev_t, formats)
+        .build()
+        .expect("[veil-host] failed to build dmabuf feedback")
+}
+
+/// Import a linear dmabuf by mmapping plane 0 and converting pixels to RGBA.
+/// Only single-plane ARGB/XRGB/ABGR/XBGR 8888 with linear layout are supported.
+fn import_dmabuf(dmabuf: &Dmabuf) -> Option<(Vec<u8>, u32, u32)> {
+    if dmabuf.num_planes() != 1 { return None; }
+    let fmt    = dmabuf.format();
+    let w      = dmabuf.width()  as usize;
+    let h      = dmabuf.height() as usize;
+    let stride = dmabuf.strides().next()? as usize;
+    let offset = dmabuf.offsets().next()? as usize;
+
+    if stride < w * 4 { return None; }
+
+    let mapping = dmabuf.map_plane(0, DmabufMappingMode::READ).ok()?;
+    let raw = unsafe { std::slice::from_raw_parts(mapping.ptr() as *const u8, mapping.length()) };
+
+    let pixel_data = raw.get(offset..)?;
+    if pixel_data.len() < stride * h { return None; }
+
+    let mut out = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        let row = &pixel_data[y * stride .. y * stride + w * 4];
+        for px in row.chunks_exact(4) {
+            // DRM stores as little-endian u32: ARGB8888 = B,G,R,A in memory
+            let (r, g, b) = match fmt.code {
+                Fourcc::Argb8888 | Fourcc::Xrgb8888 => (px[2], px[1], px[0]),
+                Fourcc::Abgr8888 | Fourcc::Xbgr8888 => (px[0], px[1], px[2]),
+                _ => return None,
+            };
+            out.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    Some((out, w as u32, h as u32))
+}
 
 fn shm_to_rgba(raw: &[u8], data: &smithay::wayland::shm::BufferData) -> Option<(Vec<u8>, u32, u32)> {
     let w = data.width  as usize;
@@ -569,6 +722,22 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
     let _ = state.frame_tx.send(Frame {
         rgba: back, width: w, height: h, serial: state.frame_serial,
     });
+
+    // Fire frame callbacks now that we've consumed and displayed this frame.
+    // Chromium uses these as vsync: it won't submit the next buffer until
+    // it receives one. Firing here (after composite) caps Chromium's render
+    // rate to our composite_interval instead of the 8ms tick rate.
+    let time = state.start_time.elapsed().as_millis() as u32;
+    let surfaces: Vec<WlSurface> = state.toplevels.iter()
+        .filter(|t| t.alive())
+        .map(|t| t.wl_surface().clone())
+        .collect();
+    for s in &surfaces {
+        send_frame_callbacks(s, time);
+        for (popup, _) in PopupManager::popups_for_surface(&s) {
+            send_frame_callbacks(popup.wl_surface(), time);
+        }
+    }
 }
 
 fn send_frame_callbacks(surface: &WlSurface, time: u32) {
@@ -744,17 +913,27 @@ pub fn run(
     let xdg_shell_state  = XdgShellState::new::<State>(&dh);
     let xdg_activation   = XdgActivationState::new::<State>(&dh);
     let output_manager   = OutputManagerState::new_with_xdg_output::<State>(&dh);
-    // Stub dmabuf: advertise the global with zero supported formats. Apps that
-    // probe linux-dmabuf-v1 see the global; every Params::create attempt fails
-    // via ImportNotifier::failed(), pushing them to shm fallback.
-    let mut dmabuf_state = DmabufState::new();
-    let _dmabuf_global   = dmabuf_state.create_global::<State>(&dh, std::iter::empty());
-    let _data_device     = DataDeviceState::new::<State>(&dh);
-    let _xdg_decoration  = XdgDecorationState::new::<State>(&dh);
-    let _viewporter      = ViewporterState::new::<State>(&dh);
-    let _fractional      = FractionalScaleManagerState::new::<State>(&dh);
+    // v4 dmabuf with default feedback: tell Chromium which DRM device to
+    // allocate on and that we only accept linear buffers. Chromium reads
+    // the feedback tranche and allocates DRM_FORMAT_MOD_LINEAR, which our
+    // map_plane mmap path can import directly without GPU decompression.
+    let mut dmabuf_state  = DmabufState::new();
+    let dmabuf_feedback   = build_dmabuf_feedback();
+    let _dmabuf_global    = dmabuf_state.create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
+    let _data_device          = DataDeviceState::new::<State>(&dh);
+    let _xdg_decoration       = XdgDecorationState::new::<State>(&dh);
+    let _viewporter           = ViewporterState::new::<State>(&dh);
+    let _fractional           = FractionalScaleManagerState::new::<State>(&dh);
     // clk_id 1 = CLOCK_MONOTONIC.
-    let _presentation    = PresentationState::new::<State>(&dh, 1);
+    let _presentation         = PresentationState::new::<State>(&dh, 1);
+    let _text_input           = TextInputManagerState::new::<State>(&dh);
+    let _primary_sel          = PrimarySelectionState::new::<State>(&dh);
+    let _cursor_shape         = CursorShapeManagerState::new::<State>(&dh);
+    let _pointer_constraints  = PointerConstraintsState::new::<State>(&dh);
+    let _relative_pointer     = RelativePointerManagerState::new::<State>(&dh);
+    let _idle_inhibit         = IdleInhibitManagerState::new::<State>(&dh);
+    let _kb_inhibit           = KeyboardShortcutsInhibitState::new::<State>(&dh);
+    let _tablet               = TabletManagerState::new::<State>(&dh);
     let mut seat_state   = SeatState::<State>::new();
     let mut seat         = seat_state.new_wl_seat(&dh, "veil-seat");
     let keyboard = seat
@@ -804,6 +983,8 @@ pub fn run(
         dmabuf_state, _dmabuf_global,
         _data_device,
         _xdg_decoration, _viewporter, _fractional, _presentation,
+        _text_input, _primary_sel, _cursor_shape,
+        _pointer_constraints, _relative_pointer, _idle_inhibit, _kb_inhibit, _tablet,
         seat, keyboard, pointer,
         output,
         output_w: width, output_h: height,
@@ -887,7 +1068,6 @@ pub fn run(
 
     // 4. Periodic timer: drain input channel, send frame callbacks,
     //    flush clients, check stop flag. 8 ms tick = ~120 Hz ceiling.
-    let start = Instant::now();
     let socket_name_owned = socket_name.to_string();
     let stop_t = stop.clone();
     let tick = Timer::immediate();
@@ -948,20 +1128,8 @@ pub fn run(
         }
 
         // Composite all dirty surfaces into one RGBA frame and ship it.
+        // Frame callbacks are fired inside composite_and_send after the frame is sent.
         composite_and_send(&mut data.state, composite_interval);
-
-        // Send frame callbacks for live toplevels (and their popups).
-        let time = start.elapsed().as_millis() as u32;
-        let surfaces: Vec<WlSurface> = data.state.toplevels.iter()
-            .filter(|t| t.alive())
-            .map(|t| t.wl_surface().clone())
-            .collect();
-        for s in &surfaces {
-            send_frame_callbacks(s, time);
-            for (popup, _) in PopupManager::popups_for_surface(s) {
-                send_frame_callbacks(popup.wl_surface(), time);
-            }
-        }
 
         // Flush outgoing wayland messages.
         let _ = data.display.flush_clients();
@@ -982,10 +1150,6 @@ pub fn run(
             // Don't unset DISPLAY — XWayland may have set it by the time
             // the child execs, or will shortly. Children that prefer
             // wayland (anything modern) will use WAYLAND_DISPLAY first.
-            // For Chromium / Electron, hint at software rendering so
-            // they don't immediately die on missing dmabuf.
-            cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
-            cmd.env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
             if wayland_debug {
                 cmd.env("WAYLAND_DEBUG", "1");
             }

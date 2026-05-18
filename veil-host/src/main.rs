@@ -26,6 +26,7 @@ use std::fmt::Write as _;
 use veil_host::{Host, HostConfig, InputCmd};
 use veil_render::{rgba_to_halfblocks, compute_luma, luma_to_chars, apply_hysteresis, render_kitty_frame, KITTY_DELETE};
 use veil_config::{Quality, detect_quality};
+use veil_gpu::GpuEncoder;
 
 #[derive(Copy, Clone, Debug)]
 enum RenderMode { Kitty, Halfblock, Ascii, AsciiEdge }
@@ -41,12 +42,42 @@ fn quality_to_mode(q: Quality) -> RenderMode {
 }
 
 const LOG_PATH: &str = "/tmp/veil.log";
+const VERSION: &str  = env!("CARGO_PKG_VERSION");
 
-fn usage() -> ! {
-    eprintln!("usage:");
-    eprintln!("  veil-host run [-d] [-w W] [-h H] [-m kitty|halfblock|ascii|ascii-edge] [-s SOCKET] <command> [args...]");
-    eprintln!("  veil-host probe");
-    std::process::exit(2);
+fn print_help() {
+    println!("veil-host {VERSION} — nested Wayland compositor → terminal renderer");
+    println!();
+    println!("USAGE");
+    println!("  veil-host <subcommand> [flags] [args]");
+    println!();
+    println!("SUBCOMMANDS");
+    println!("  run <command> [args...]   Launch a GUI app inside the compositor");
+    println!("  probe                     Show terminal capabilities and resolved config");
+    println!("  list-modes                List all render modes and which one would be chosen");
+    println!();
+    println!("RUN FLAGS");
+    println!("  -m, --mode <mode>         Force a render mode (see list-modes for options)");
+    println!("  -d, --debug               Redirect all logs to /tmp/veil.log");
+    println!("  -w, --width <px>          Override compositor width  (default: cols × 8)");
+    println!("  -h, --height <px>         Override compositor height (default: rows × 16)");
+    println!("  -s, --socket <name>       Wayland socket name (default: wayland-veil-0)");
+    println!("      --stats               Show fps / frame-size bar on the bottom row");
+    println!();
+    println!("GLOBAL FLAGS");
+    println!("  -v, --version             Print version and exit");
+    println!("      --help                Print this help and exit");
+    println!();
+    println!("EXAMPLES");
+    println!("  veil-host run thunar");
+    println!("  veil-host run -d -m halfblock firefox");
+    println!("  veil-host run --stats nautilus");
+    println!("  veil-host probe");
+    println!("  veil-host list-modes");
+    println!();
+    println!("CONFIG");
+    println!("  Place config.lua at ./config.lua or ~/.config/veil/config.lua");
+    println!("    quality = \"auto\"   -- auto | kitty | pixel | ascii | ascii_edge");
+    println!("    fps     = 60       -- compositor frame rate cap");
 }
 
 fn main() -> std::io::Result<()> {
@@ -54,14 +85,18 @@ fn main() -> std::io::Result<()> {
     let subcmd = raw_args.next().unwrap_or_default();
 
     match subcmd.as_str() {
-        "probe" => return cmd_probe(),
-        "run"   => {}
-        _       => usage(),
+        "-v" | "--version"  => { println!("veil-host {VERSION}"); return Ok(()); }
+        "--help"            => { print_help(); return Ok(()); }
+        "probe"             => return cmd_probe(),
+        "list-modes"        => { cmd_list_modes(); return Ok(()); }
+        "run"               => {}
+        _                   => { eprintln!("unknown subcommand: {subcmd:?}"); eprintln!("run 'veil-host --help' for usage"); std::process::exit(2); }
     }
 
     // ── `run` subcommand ──────────────────────────────────────────────────────
     let mut cfg        = HostConfig::default();
     let mut debug      = false;
+    let mut stats      = false;
     let mut mode_override: Option<RenderMode> = None;
     let mut spawn: Vec<String> = Vec::new();
     let mut explicit_size = false;
@@ -69,7 +104,9 @@ fn main() -> std::io::Result<()> {
     while let Some(a) = raw_args.next() {
         if !spawn.is_empty() { spawn.push(a); continue; }
         match a.as_str() {
-            "-d" | "--debug" => { debug = true; cfg.wayland_debug = true; }
+            "--help"          => { print_help(); return Ok(()); }
+            "-d" | "--debug"  => { debug = true; cfg.wayland_debug = true; }
+            "--stats"         => { stats = true; }
             "-w" | "--width"  => {
                 cfg.width = raw_args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.width);
                 explicit_size = true;
@@ -83,16 +120,16 @@ fn main() -> std::io::Result<()> {
                 Some("halfblock")  => mode_override = Some(RenderMode::Halfblock),
                 Some("ascii")      => mode_override = Some(RenderMode::Ascii),
                 Some("ascii-edge") => mode_override = Some(RenderMode::AsciiEdge),
-                other => { eprintln!("unknown mode: {other:?}"); usage(); }
+                other => { eprintln!("unknown mode: {other:?}\nrun 'veil-host --help' for usage"); std::process::exit(2); }
             },
             "-s" | "--socket" => {
-                cfg.socket_name = raw_args.next().unwrap_or_else(|| usage());
+                cfg.socket_name = raw_args.next().unwrap_or_else(|| { eprintln!("--socket requires a value"); std::process::exit(2); });
             }
-            other if other.starts_with('-') => { eprintln!("unknown flag: {other}"); usage(); }
+            other if other.starts_with('-') => { eprintln!("unknown flag: {other}\nrun 'veil-host --help' for usage"); std::process::exit(2); }
             cmd => { spawn.push(cmd.to_string()); }
         }
     }
-    if spawn.is_empty() { eprintln!("error: run requires a command"); usage(); }
+    if spawn.is_empty() { eprintln!("error: 'run' requires a command\nrun 'veil-host --help' for usage"); std::process::exit(2); }
     cfg.spawn = Some(spawn);
 
     // Load config.lua — ./config.lua then ~/.config/veil/config.lua.
@@ -116,13 +153,19 @@ fn main() -> std::io::Result<()> {
     });
 
     cfg.fps = vcfg.fps;
+    let use_gpu = vcfg.gpu_render;
 
     // Size compositor to match actual terminal pixel area unless user gave explicit dims.
     // Assume 8×16 px per cell — the most common monospace glyph box.
     let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
     if !explicit_size {
-        cfg.width  = term_cols as u32 * 8;
-        cfg.height = term_rows as u32 * 16;
+        if let Some((pw, ph)) = term_pixel_size() {
+            cfg.width  = pw;
+            cfg.height = ph;
+        } else {
+            cfg.width  = term_cols as u32 * 8;
+            cfg.height = term_rows as u32 * 16;
+        }
     }
 
     // ── Debug mode: redirect stderr into /tmp/veil.log so it doesn't corrupt
@@ -183,23 +226,29 @@ fn main() -> std::io::Result<()> {
             eprintln!("[veil-host] input thread started");
             let mut tick = 0u32;
             let mut btns = [false; 3];
+            let mut held_keys = std::collections::HashSet::<u32>::new();
             // Mutable local copies — updated on every Resize event so mouse
             // mapping stays correct after the terminal window is resized.
             let mut cur_cols = cols;
             let mut cur_rows = rows;
+            let mut last_event_time = std::time::Instant::now();
             while running.load(Ordering::Relaxed) {
-                match event::poll(Duration::from_millis(100)) {
-                    Ok(true)  => {}
+                match event::poll(Duration::from_millis(1)) {
+                    Ok(true)  => { last_event_time = std::time::Instant::now(); }
                     Ok(false) => {
                         tick = tick.wrapping_add(1);
-                        if tick % 50 == 0 { eprintln!("[veil-host] input idle ({}s)", tick / 10); }
+                        // Log idle every 30s based on wall time, not poll ticks.
+                        let idle_secs = last_event_time.elapsed().as_secs();
+                        if idle_secs > 0 && tick % 30_000 == 0 {
+                            eprintln!("[veil-host] input idle {}s", idle_secs);
+                        }
                         continue;
                     }
                     Err(e) => { eprintln!("[veil-host] poll error: {e}"); continue; }
                 }
                 match event::read() {
                     Ok(ev) => {
-                        eprintln!("[veil-host] event: {ev:?}");
+                        tracing::debug!("event: {ev:?}");
                         match ev {
                             Event::Key(k) if is_ctrl_c(&k) => {
                                 eprintln!("[veil-host] ctrl-c → shutdown");
@@ -207,7 +256,7 @@ fn main() -> std::io::Result<()> {
                                 host_stop.store(true, Ordering::Relaxed);
                                 break;
                             }
-                            Event::Key(k) => forward_key(&input_tx, k),
+                            Event::Key(k) => forward_key(&input_tx, k, &mut held_keys),
                             Event::Mouse(m) => {
                                 let cw = cur_w_t.load(std::sync::atomic::Ordering::Relaxed);
                                 let ch = cur_h_t.load(std::sync::atomic::Ordering::Relaxed);
@@ -216,8 +265,8 @@ fn main() -> std::io::Result<()> {
                             Event::Resize(new_cols, new_rows) => {
                                 cur_cols = new_cols;
                                 cur_rows = new_rows;
-                                let nw = new_cols as u32 * 8;
-                                let nh = new_rows as u32 * 16;
+                                let (nw, nh) = term_pixel_size()
+                                    .unwrap_or((new_cols as u32 * 8, new_rows as u32 * 16));
                                 cur_w_t.store(nw, std::sync::atomic::Ordering::Relaxed);
                                 cur_h_t.store(nh, std::sync::atomic::Ordering::Relaxed);
                                 let _ = input_tx.send(InputCmd::Resize { width: nw, height: nh });
@@ -232,8 +281,22 @@ fn main() -> std::io::Result<()> {
         });
     }
 
+    // ── GPU encoder (optional, config-controlled) ─────────────────────────────
+    let gpu: Option<GpuEncoder> = if use_gpu && !matches!(mode, RenderMode::Kitty) {
+        match GpuEncoder::new() {
+            Some(g) => { eprintln!("[veil-host] GPU encoder active"); Some(g) }
+            None    => { eprintln!("[veil-host] GPU encoder unavailable, falling back to CPU"); None }
+        }
+    } else {
+        None
+    };
+
     // ── frame loop ────────────────────────────────────────────────────────────
     let mut stable_luma: Vec<u8> = Vec::new();
+    let mut fps_frame_count = 0u32;
+    let mut fps_last        = std::time::Instant::now();
+    let mut fps_display     = 0.0f32;
+
     while running.load(Ordering::Relaxed) {
         let mut frame = match host.frames().recv_timeout(Duration::from_millis(200)) {
             Ok(f) => f,
@@ -245,26 +308,40 @@ fn main() -> std::io::Result<()> {
 
         // Re-read terminal size each frame so rendering stays in sync after resize.
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let usable_rows = rows.saturating_sub(1);
+        // Stats bar lives on the bottom row; shrink render area by 1 when active.
+        let usable_rows = rows.saturating_sub(if stats { 2 } else { 1 });
 
         let out = match mode {
             RenderMode::Kitty => {
+                // Kitty sends raw RGBA — GPU has no encoding work to do here.
                 let mut s = String::new();
                 let _ = write!(s, "\x1b[H");
                 s.push_str(&render_kitty_frame(&frame.rgba, frame.width, frame.height, cols, usable_rows));
                 s
             }
             RenderMode::Halfblock => {
-                let cells = rgba_to_halfblocks(&frame.rgba, frame.width, frame.height, cols, usable_rows);
+                let cells = if let Some(ref g) = gpu {
+                    g.encode_halfblock(&frame.rgba, frame.width, frame.height, cols, usable_rows)
+                } else {
+                    rgba_to_halfblocks(&frame.rgba, frame.width, frame.height, cols, usable_rows)
+                };
                 emit_halfblocks(&cells, cols, usable_rows)
             }
             RenderMode::Ascii => {
-                let luma = compute_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows);
+                let luma = if let Some(ref g) = gpu {
+                    g.encode_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows)
+                } else {
+                    compute_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows)
+                };
                 let chars = luma_to_chars(&luma, cols, usable_rows);
                 emit_chars(&chars, cols, usable_rows)
             }
             RenderMode::AsciiEdge => {
-                let luma = compute_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows);
+                let luma = if let Some(ref g) = gpu {
+                    g.encode_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows)
+                } else {
+                    compute_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows)
+                };
                 if stable_luma.len() != luma.len() { stable_luma = luma.clone(); }
                 apply_hysteresis(&mut stable_luma, &luma, 10);
                 let chars = luma_to_chars(&stable_luma, cols, usable_rows);
@@ -272,10 +349,43 @@ fn main() -> std::io::Result<()> {
             }
         };
         stdout.write_all(out.as_bytes())?;
+
+        // Stats bar — bottom row, dim text, no flicker on the render area.
+        if stats {
+            fps_frame_count += 1;
+            let elapsed = fps_last.elapsed();
+            if elapsed.as_secs_f32() >= 1.0 {
+                fps_display     = fps_frame_count as f32 / elapsed.as_secs_f32();
+                fps_frame_count = 0;
+                fps_last        = std::time::Instant::now();
+            }
+            let mode_name = match mode {
+                RenderMode::Kitty     => "kitty",
+                RenderMode::Halfblock => "halfblock",
+                RenderMode::Ascii     => "ascii",
+                RenderMode::AsciiEdge => "ascii-edge",
+            };
+            let bar = format!(
+                "\x1b[{};1H\x1b[2K\x1b[90m veil-host {VERSION}  fps:{:.0}  compositor:{}x{}px  mode:{}  terminal:{}x{} \x1b[0m",
+                rows, fps_display, frame.width, frame.height, mode_name, cols, rows,
+            );
+            stdout.write_all(bar.as_bytes())?;
+        }
+
         stdout.flush()?;
     }
 
     Ok(())
+}
+
+fn term_pixel_size() -> Option<(u32, u32)> {
+    let mut winsz: libc::winsize = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsz) };
+    if ret == 0 && winsz.ws_xpixel > 0 && winsz.ws_ypixel > 0 {
+        Some((winsz.ws_xpixel as u32, winsz.ws_ypixel as u32))
+    } else {
+        None
+    }
 }
 
 fn dirs_config() -> std::path::PathBuf {
@@ -288,12 +398,43 @@ fn dirs_config() -> std::path::PathBuf {
         .join("veil")
 }
 
+// ─── list-modes ───────────────────────────────────────────────────────────────
+
+fn cmd_list_modes() {
+    let detected = detect_quality();
+    let auto_mode = quality_to_mode(detected.clone());
+
+    println!("RENDER MODES");
+    println!();
+
+    let modes = [
+        ("kitty",      RenderMode::Kitty,     "Kitty Graphics Protocol — native pixel images, best quality",        "$TERM=xterm-kitty or WezTerm"),
+        ("halfblock",  RenderMode::Halfblock,  "Unicode ▀ half-blocks with 24-bit truecolor, 2× vertical res",      "$COLORTERM=truecolor or 24bit"),
+        ("ascii",      RenderMode::Ascii,      "Luma-mapped ASCII characters, works in any terminal",               "any"),
+        ("ascii-edge", RenderMode::AsciiEdge,  "Luma with hysteresis edge-detection, sharper than ascii",           "any"),
+    ];
+
+    for (name, variant, desc, req) in &modes {
+        let marker = if std::mem::discriminant(variant) == std::mem::discriminant(&auto_mode) {
+            " ◀ auto-selected"
+        } else {
+            ""
+        };
+        println!("  {name:<12}{desc}{marker}");
+        println!("  {:<12}requires: {req}", "");
+        println!();
+    }
+
+    println!("Use -m <mode> to override.  Auto-detection is based on $TERM / $COLORTERM.");
+}
+
 // ─── probe ────────────────────────────────────────────────────────────────────
 
 fn cmd_probe() -> std::io::Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let comp_w = cols as u32 * 8;
-    let comp_h = rows as u32 * 16;
+    let pixel_dims = term_pixel_size();
+    let (comp_w, comp_h) = pixel_dims.unwrap_or((cols as u32 * 8, rows as u32 * 16));
+    let pixel_source = if pixel_dims.is_some() { "TIOCGWINSZ" } else { "cols×8, rows×16 (estimate)" };
 
     let term      = std::env::var("TERM").unwrap_or_else(|_| "unknown".into());
     let colorterm = std::env::var("COLORTERM").unwrap_or_else(|_| "unset".into());
@@ -319,11 +460,12 @@ fn cmd_probe() -> std::io::Result<()> {
     println!("terminal        : {term}");
     println!("colorterm       : {colorterm}");
     println!("term size       : {cols}x{rows} cells");
-    println!("compositor      : {comp_w}x{comp_h} px  (cols×8, rows×16)");
+    println!("compositor      : {comp_w}x{comp_h} px  ({pixel_source})");
     println!("detected quality: {:?}", detected);
     println!("config quality  : {:?}", vcfg.quality);
     println!("resolved mode   : {final_mode:?}");
     println!("fps             : {}", vcfg.fps);
+    println!("gpu_render      : {}", if vcfg.gpu_render { "on (default)" } else { "off" });
     println!("config file     : {}", config_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (using defaults)".into()));
     println!("WAYLAND_DISPLAY : {wayland}");
     println!("DISPLAY         : {display}");
@@ -501,40 +643,54 @@ fn is_ctrl_c(k: &KeyEvent) -> bool {
     matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// Map crossterm KeyEvent → evdev keycode, push press+release to host.
-/// Lossy — the terminal already decoded our keypress into a char so we
-/// reverse-map back to a keycode. Good enough for typing.
-fn forward_key(tx: &std::sync::mpsc::Sender<InputCmd>, k: KeyEvent) {
-    // crossterm v0.28 emits both Press and Release on terminals that
-    // support the kitty keyboard protocol. On dumb terminals it only
-    // emits Press. Treat unspecified as press+release pair.
+/// Map crossterm KeyEvent → evdev keycode, forward to host with proper hold/release tracking.
+///
+/// Terminals supporting the kitty keyboard protocol emit Press, Repeat, Release.
+/// Dumb terminals only emit Press. The held set lets us tell the difference:
+/// a Press for a key already in held = dumb-terminal repeat → synthesize a tap.
+fn forward_key(
+    tx:   &std::sync::mpsc::Sender<InputCmd>,
+    k:    KeyEvent,
+    held: &mut std::collections::HashSet<u32>,
+) {
     let keycode = match keycode_for(k.code) {
         Some(c) => c,
         None => return,
     };
-    let shift_needed = needs_shift(k.code) || k.modifiers.contains(KeyModifiers::SHIFT);
+    let shift = needs_shift(k.code) || k.modifiers.contains(KeyModifiers::SHIFT);
     let ctrl  = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt   = k.modifiers.contains(KeyModifiers::ALT);
 
-    // Modifier holds first.
-    if shift_needed { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: true }); }
-    if ctrl         { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: true }); }
-    if alt          { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: true }); }
-
     match k.kind {
+        KeyEventKind::Repeat => {
+            // Key is physically held — the Wayland client drives repeat via
+            // wl_keyboard.repeat_info, so we don't need to resend anything.
+        }
         KeyEventKind::Release => {
-            let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: false });
+            if held.remove(&keycode) {
+                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: false });
+                if alt   { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: false }); }
+                if ctrl  { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: false }); }
+                if shift { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: false }); }
+            }
         }
         _ => {
-            // Press for everything else (Press / Repeat / unknown).
-            let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: true });
-            let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: false });
+            // Press (or unknown — dumb terminal that never sends Release).
+            if !held.contains(&keycode) {
+                // First press: hold the key so the client's repeat timer fires.
+                held.insert(keycode);
+                if shift { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: true }); }
+                if ctrl  { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: true }); }
+                if alt   { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: true }); }
+                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: true });
+            } else {
+                // Dumb-terminal repeat: synthesize a tap without touching modifiers
+                // (they're already held from the original press).
+                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: true });
+                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: false });
+            }
         }
     }
-
-    if alt          { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: false }); }
-    if ctrl         { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: false }); }
-    if shift_needed { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: false }); }
 }
 
 fn needs_shift(code: KeyCode) -> bool {

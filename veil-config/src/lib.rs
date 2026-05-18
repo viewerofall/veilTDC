@@ -71,6 +71,9 @@ pub struct VeilConfig {
     pub fps:               u32,
     pub cage_timeout_secs: u32,
     pub input:             bool,
+    /// Whether to use GPU compute shaders for frame encoding (halfblock/luma).
+    /// Defaults to true. Set `gpu_render = false` in config.lua to disable.
+    pub gpu_render:        bool,
 }
 
 impl Default for VeilConfig {
@@ -80,6 +83,7 @@ impl Default for VeilConfig {
             fps:               60,
             cage_timeout_secs: 8,
             input:             true,
+            gpu_render:        true,
         }
     }
 }
@@ -125,5 +129,7 @@ pub fn load(path: &Path) -> VeilConfig {
             .unwrap_or(d.cage_timeout_secs),
         input: gl.get::<bool>("input")
             .unwrap_or(d.input),
+        gpu_render: gl.get::<bool>("gpu_render")
+            .unwrap_or(d.gpu_render),
     }
 }
