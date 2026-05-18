@@ -3,7 +3,7 @@
 Cargo.lock
 **/*.rs.bk
 *.pdb
-
+*.tar.gz
 # Build artifacts
 *.o
 *.a
