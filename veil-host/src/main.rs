@@ -24,46 +24,109 @@ use crossterm::{
 };
 use std::fmt::Write as _;
 use veil_host::{Host, HostConfig, InputCmd};
-use veil_render::{rgba_to_halfblocks, compute_luma, luma_to_chars, render_kitty_frame, KITTY_DELETE};
+use veil_render::{rgba_to_halfblocks, compute_luma, luma_to_chars, apply_hysteresis, render_kitty_frame, KITTY_DELETE};
+use veil_config::{Quality, detect_quality};
 
 #[derive(Copy, Clone, Debug)]
-enum RenderMode { Kitty, Halfblock, Ascii }
+enum RenderMode { Kitty, Halfblock, Ascii, AsciiEdge }
+
+fn quality_to_mode(q: Quality) -> RenderMode {
+    match q {
+        Quality::Kitty                => RenderMode::Kitty,
+        Quality::Pixel                => RenderMode::Halfblock,
+        Quality::AsciiLuma            => RenderMode::Ascii,
+        Quality::AsciiEdge            => RenderMode::AsciiEdge,
+        Quality::Sixel | Quality::Auto => RenderMode::Kitty,
+    }
+}
 
 const LOG_PATH: &str = "/tmp/veil.log";
 
-fn main() -> std::io::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let mut cfg = HostConfig::default();
-    let mut debug = false;
-    let mut mode  = RenderMode::Kitty;
-    let mut argv_seen_sep = false;
-    let mut spawn: Vec<String> = Vec::new();
+fn usage() -> ! {
+    eprintln!("usage:");
+    eprintln!("  veil-host run [-d] [-w W] [-h H] [-m kitty|halfblock|ascii|ascii-edge] [-s SOCKET] <command> [args...]");
+    eprintln!("  veil-host probe");
+    std::process::exit(2);
+}
 
-    while let Some(a) = args.next() {
-        if argv_seen_sep { spawn.push(a); continue; }
+fn main() -> std::io::Result<()> {
+    let mut raw_args = std::env::args().skip(1);
+    let subcmd = raw_args.next().unwrap_or_default();
+
+    match subcmd.as_str() {
+        "probe" => return cmd_probe(),
+        "run"   => {}
+        _       => usage(),
+    }
+
+    // ── `run` subcommand ──────────────────────────────────────────────────────
+    let mut cfg        = HostConfig::default();
+    let mut debug      = false;
+    let mut mode_override: Option<RenderMode> = None;
+    let mut spawn: Vec<String> = Vec::new();
+    let mut explicit_size = false;
+
+    while let Some(a) = raw_args.next() {
+        if !spawn.is_empty() { spawn.push(a); continue; }
         match a.as_str() {
-            "--" => argv_seen_sep = true,
             "-d" | "--debug" => { debug = true; cfg.wayland_debug = true; }
-            "-w" | "--width"  => cfg.width  = args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.width),
-            "-h" | "--height" => cfg.height = args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.height),
-            "-m" | "--mode" => match args.next().as_deref() {
-                Some("kitty")     => mode = RenderMode::Kitty,
-                Some("halfblock") => mode = RenderMode::Halfblock,
-                Some("ascii")     => mode = RenderMode::Ascii,
-                other => { eprintln!("unknown mode: {other:?} (kitty|halfblock|ascii)"); std::process::exit(2); }
-            },
-            other if !other.starts_with('-') && cfg.socket_name == "wayland-veil-0" => {
-                cfg.socket_name = other.to_string();
+            "-w" | "--width"  => {
+                cfg.width = raw_args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.width);
+                explicit_size = true;
             }
-            _ => { eprintln!("unknown arg: {a}"); std::process::exit(2); }
+            "-h" | "--height" => {
+                cfg.height = raw_args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.height);
+                explicit_size = true;
+            }
+            "-m" | "--mode" => match raw_args.next().as_deref() {
+                Some("kitty")      => mode_override = Some(RenderMode::Kitty),
+                Some("halfblock")  => mode_override = Some(RenderMode::Halfblock),
+                Some("ascii")      => mode_override = Some(RenderMode::Ascii),
+                Some("ascii-edge") => mode_override = Some(RenderMode::AsciiEdge),
+                other => { eprintln!("unknown mode: {other:?}"); usage(); }
+            },
+            "-s" | "--socket" => {
+                cfg.socket_name = raw_args.next().unwrap_or_else(|| usage());
+            }
+            other if other.starts_with('-') => { eprintln!("unknown flag: {other}"); usage(); }
+            cmd => { spawn.push(cmd.to_string()); }
         }
     }
-    if !spawn.is_empty() { cfg.spawn = Some(spawn); }
+    if spawn.is_empty() { eprintln!("error: run requires a command"); usage(); }
+    cfg.spawn = Some(spawn);
 
-    // ── Debug mode: redirect stderr (and anything writing to fd 2, including
-    //    tracing-subscriber and libc::eprintln) into /tmp/veil.log. This is
-    //    what made base-veil display correctly — anything spilling onto the
-    //    host terminal corrupts the kitty graphics on stdout.
+    // Load config.lua — ./config.lua then ~/.config/veil/config.lua.
+    let vcfg = [
+        std::path::PathBuf::from("config.lua"),
+        dirs_config().join("config.lua"),
+    ]
+    .iter()
+    .find(|p| p.exists())
+    .map(|p| veil_config::load(p))
+    .unwrap_or_default();
+
+    // Render mode: CLI flag wins, then config quality, then auto-detect.
+    let mode = mode_override.unwrap_or_else(|| {
+        let q = if vcfg.quality == veil_config::Quality::Auto {
+            detect_quality()
+        } else {
+            vcfg.quality.clone()
+        };
+        quality_to_mode(q)
+    });
+
+    cfg.fps = vcfg.fps;
+
+    // Size compositor to match actual terminal pixel area unless user gave explicit dims.
+    // Assume 8×16 px per cell — the most common monospace glyph box.
+    let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
+    if !explicit_size {
+        cfg.width  = term_cols as u32 * 8;
+        cfg.height = term_rows as u32 * 16;
+    }
+
+    // ── Debug mode: redirect stderr into /tmp/veil.log so it doesn't corrupt
+    //    kitty graphics on stdout.
     if debug { init_debug_log()?; }
     init_tracing(debug);
 
@@ -74,6 +137,9 @@ fn main() -> std::io::Result<()> {
 
     let comp_w = cfg.width;
     let comp_h = cfg.height;
+    // Track current compositor dims — updated on resize events.
+    let cur_w = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(comp_w));
+    let cur_h = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(comp_h));
     let host   = Host::spawn(cfg)?;
 
     // ── SIGINT handler: if ctrl-c slips past raw mode (eg. via `kill -INT`
@@ -111,11 +177,16 @@ fn main() -> std::io::Result<()> {
         let running   = running.clone();
         let host_stop = host.stop_flag();
         let input_tx  = host.input_sender();
-        let (cw, ch)  = (comp_w, comp_h);
+        let cur_w_t   = cur_w.clone();
+        let cur_h_t   = cur_h.clone();
         std::thread::spawn(move || {
             eprintln!("[veil-host] input thread started");
             let mut tick = 0u32;
             let mut btns = [false; 3];
+            // Mutable local copies — updated on every Resize event so mouse
+            // mapping stays correct after the terminal window is resized.
+            let mut cur_cols = cols;
+            let mut cur_rows = rows;
             while running.load(Ordering::Relaxed) {
                 match event::poll(Duration::from_millis(100)) {
                     Ok(true)  => {}
@@ -137,7 +208,20 @@ fn main() -> std::io::Result<()> {
                                 break;
                             }
                             Event::Key(k) => forward_key(&input_tx, k),
-                            Event::Mouse(m) => forward_mouse(&input_tx, m, cols, rows, cw, ch, &mut btns),
+                            Event::Mouse(m) => {
+                                let cw = cur_w_t.load(std::sync::atomic::Ordering::Relaxed);
+                                let ch = cur_h_t.load(std::sync::atomic::Ordering::Relaxed);
+                                forward_mouse(&input_tx, m, cur_cols, cur_rows, cw, ch, &mut btns);
+                            }
+                            Event::Resize(new_cols, new_rows) => {
+                                cur_cols = new_cols;
+                                cur_rows = new_rows;
+                                let nw = new_cols as u32 * 8;
+                                let nh = new_rows as u32 * 16;
+                                cur_w_t.store(nw, std::sync::atomic::Ordering::Relaxed);
+                                cur_h_t.store(nh, std::sync::atomic::Ordering::Relaxed);
+                                let _ = input_tx.send(InputCmd::Resize { width: nw, height: nh });
+                            }
                             _ => {}
                         }
                     }
@@ -149,16 +233,19 @@ fn main() -> std::io::Result<()> {
     }
 
     // ── frame loop ────────────────────────────────────────────────────────────
-    let usable_rows = rows.saturating_sub(1);
+    let mut stable_luma: Vec<u8> = Vec::new();
     while running.load(Ordering::Relaxed) {
         let mut frame = match host.frames().recv_timeout(Duration::from_millis(200)) {
             Ok(f) => f,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        // Drain the channel — if the compositor produced multiple frames
-        // while we were encoding/writing the previous one, skip to latest.
+        // Drain the channel — skip to latest frame if compositor is ahead.
         while let Ok(f) = host.frames().try_recv() { frame = f; }
+
+        // Re-read terminal size each frame so rendering stays in sync after resize.
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let usable_rows = rows.saturating_sub(1);
 
         let out = match mode {
             RenderMode::Kitty => {
@@ -176,11 +263,71 @@ fn main() -> std::io::Result<()> {
                 let chars = luma_to_chars(&luma, cols, usable_rows);
                 emit_chars(&chars, cols, usable_rows)
             }
+            RenderMode::AsciiEdge => {
+                let luma = compute_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows);
+                if stable_luma.len() != luma.len() { stable_luma = luma.clone(); }
+                apply_hysteresis(&mut stable_luma, &luma, 10);
+                let chars = luma_to_chars(&stable_luma, cols, usable_rows);
+                emit_chars(&chars, cols, usable_rows)
+            }
         };
         stdout.write_all(out.as_bytes())?;
         stdout.flush()?;
     }
 
+    Ok(())
+}
+
+fn dirs_config() -> std::path::PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".config")
+        })
+        .join("veil")
+}
+
+// ─── probe ────────────────────────────────────────────────────────────────────
+
+fn cmd_probe() -> std::io::Result<()> {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let comp_w = cols as u32 * 8;
+    let comp_h = rows as u32 * 16;
+
+    let term      = std::env::var("TERM").unwrap_or_else(|_| "unknown".into());
+    let colorterm = std::env::var("COLORTERM").unwrap_or_else(|_| "unset".into());
+    let wayland   = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".into());
+    let display   = std::env::var("DISPLAY").unwrap_or_else(|_| "unset".into());
+
+    let config_path = [
+        std::path::PathBuf::from("config.lua"),
+        dirs_config().join("config.lua"),
+    ]
+    .iter()
+    .find(|p| p.exists())
+    .cloned();
+
+    let vcfg = config_path.as_ref()
+        .map(|p| veil_config::load(p))
+        .unwrap_or_default();
+
+    let detected   = detect_quality();
+    let resolved   = vcfg.resolved_quality();
+    let final_mode = quality_to_mode(resolved.clone());
+
+    println!("terminal        : {term}");
+    println!("colorterm       : {colorterm}");
+    println!("term size       : {cols}x{rows} cells");
+    println!("compositor      : {comp_w}x{comp_h} px  (cols×8, rows×16)");
+    println!("detected quality: {:?}", detected);
+    println!("config quality  : {:?}", vcfg.quality);
+    println!("resolved mode   : {final_mode:?}");
+    println!("fps             : {}", vcfg.fps);
+    println!("config file     : {}", config_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (using defaults)".into()));
+    println!("WAYLAND_DISPLAY : {wayland}");
+    println!("DISPLAY         : {display}");
+    println!("socket (default): wayland-veil-0");
     Ok(())
 }
 

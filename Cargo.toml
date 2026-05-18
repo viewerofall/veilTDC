@@ -1,5 +1,5 @@
 [workspace]
-members = ["veil-cli", "veil-compositor", "veil-render", "veil-config", "veil-host"]
+members = ["veil-render", "veil-config", "veil-host"]
 resolver = "2"
 
 [workspace.dependencies]

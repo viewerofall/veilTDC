@@ -159,7 +159,9 @@ impl CompositorHandler for State {
         if let Some(d) = client.get_data::<XWaylandClientData>() {
             return &d.compositor_state;
         }
-        panic!("client missing both ClientState and XWaylandClientData");
+        eprintln!("[veil-host] unknown client type — disconnecting");
+        static FALLBACK: std::sync::OnceLock<CompositorClientState> = std::sync::OnceLock::new();
+        FALLBACK.get_or_init(CompositorClientState::default)
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -511,14 +513,11 @@ fn blit_subtree(
 
 /// Composite all live toplevels + their popups + the cursor into a single
 /// RGBA frame and ship it. Called from the periodic tick when `dirty`.
-fn composite_and_send(state: &mut State) {
+fn composite_and_send(state: &mut State, composite_interval: Duration) {
     if !state.dirty { return; }
-    // Throttle to ~30 fps. Composition+encode+stdout is the bottleneck;
-    // pointer motion at terminal rate (>100 Hz) would queue frames faster
-    // than the renderer thread can drain them.
     let now = Instant::now();
     if let Some(t) = state.last_composite {
-        if now.duration_since(t) < Duration::from_millis(33) { return; }
+        if now.duration_since(t) < composite_interval { return; }
     }
     state.last_composite = Some(now);
     state.dirty = false;
@@ -677,6 +676,30 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             ptr.frame(state);
         }
 
+        InputCmd::Resize { width, height } => {
+            // Rescale existing pointer position into the new pixel space so the
+            // cursor doesn't jump on resize.
+            if state.output_w > 0 && state.output_h > 0 {
+                state.pointer_pos.0 = state.pointer_pos.0 * width  as f64 / state.output_w as f64;
+                state.pointer_pos.1 = state.pointer_pos.1 * height as f64 / state.output_h as f64;
+            }
+            state.output_w = width;
+            state.output_h = height;
+            let mode = OutputMode {
+                size: (width as i32, height as i32).into(),
+                refresh: 60_000,
+            };
+            state.output.change_current_state(Some(mode), None, None, None);
+            for tl in &state.toplevels {
+                if !tl.alive() { continue; }
+                tl.with_pending_state(|s| {
+                    s.size = Some((width as i32, height as i32).into());
+                });
+                tl.send_configure();
+            }
+            state.dirty = true;
+        }
+
         InputCmd::Scroll { v120 } => {
             // v120 = 120 per notch (Windows convention). Convert to a 15px-per-notch
             // continuous value as well; clients pick whichever they understand.
@@ -704,12 +727,14 @@ pub fn run(
     socket_name: &str,
     width:  u32,
     height: u32,
+    fps:    u32,
     spawn:  Option<Vec<String>>,
     wayland_debug: bool,
     frame_tx: mpsc::Sender<Frame>,
     input_rx: mpsc::Receiver<InputCmd>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let composite_interval = Duration::from_millis(1000 / fps.max(1) as u64);
     let display: Display<State> = Display::new()
         .map_err(|e| io::Error::other(format!("display: {e}")))?;
     let dh = display.handle();
@@ -867,6 +892,9 @@ pub fn run(
     let stop_t = stop.clone();
     let tick = Timer::immediate();
     handle.insert_source(tick, move |_, _, data| {
+        // Prune toplevels that the client has destroyed.
+        data.state.toplevels.retain(|t| t.alive());
+
         // Drain input cmds.
         while let Ok(cmd) = input_rx.try_recv() {
             apply_input(&mut data.state, cmd);
@@ -920,7 +948,7 @@ pub fn run(
         }
 
         // Composite all dirty surfaces into one RGBA frame and ship it.
-        composite_and_send(&mut data.state);
+        composite_and_send(&mut data.state, composite_interval);
 
         // Send frame callbacks for live toplevels (and their popups).
         let time = start.elapsed().as_millis() as u32;
@@ -962,7 +990,17 @@ pub fn run(
                 cmd.env("WAYLAND_DEBUG", "1");
             }
             match cmd.spawn() {
-                Ok(_)  => tracing::info!("spawned: {:?}", argv),
+                Ok(mut child) => {
+                    tracing::info!("spawned: {:?}", argv);
+                    let stop_child = stop.clone();
+                    std::thread::spawn(move || {
+                        match child.wait() {
+                            Ok(s)  => tracing::info!("child exited: {s}"),
+                            Err(e) => tracing::error!("child wait: {e}"),
+                        }
+                        stop_child.store(true, Ordering::Relaxed);
+                    });
+                }
                 Err(e) => tracing::error!("spawn {:?} failed: {e}", argv),
             }
         }

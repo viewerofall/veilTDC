@@ -18,10 +18,11 @@ pub use input::InputCmd;
 pub use sink::Frame;
 
 pub struct HostConfig {
-    pub socket_name: String,
-    pub width:  u32,
-    pub height: u32,
-    pub spawn:  Option<Vec<String>>,
+    pub socket_name:   String,
+    pub width:         u32,
+    pub height:        u32,
+    pub fps:           u32,
+    pub spawn:         Option<Vec<String>>,
     pub wayland_debug: bool,
 }
 
@@ -33,10 +34,11 @@ use std::sync::Arc as StdArc;
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            socket_name: "wayland-veil-0".to_string(),
-            width:  1280,
-            height: 720,
-            spawn:  None,
+            socket_name:   "wayland-veil-0".to_string(),
+            width:         1280,
+            height:        720,
+            fps:           60,
+            spawn:         None,
             wayland_debug: false,
         }
     }
@@ -63,6 +65,7 @@ impl Host {
                     &config.socket_name,
                     config.width,
                     config.height,
+                    config.fps,
                     config.spawn,
                     config.wayland_debug,
                     frame_tx,

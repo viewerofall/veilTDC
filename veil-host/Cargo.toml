@@ -17,6 +17,7 @@ smithay            = { workspace = true }
 calloop            = { workspace = true }
 tracing            = { workspace = true }
 veil-render        = { path = "../veil-render" }
+veil-config        = { path = "../veil-config" }
 crossterm          = { workspace = true }
 libc               = { workspace = true }
 wayland-protocols  = { version = "0.32", features = ["server"] }

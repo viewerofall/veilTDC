@@ -1,124 +1,108 @@
 # veil
 
-**Terminal compositor** — render GUI applications inside your terminal with full colour, live resize, and accessibility text overlay.
+**Nested Wayland compositor → terminal renderer.**
+Run any GUI app inside your terminal — full colour, live input, clipboard, resize.
 
 > [!IMPORTANT]
-> **AI-Assisted Project:** Developed with AI assistance. Code reviewed but not guaranteed production-ready. **Use with caution.**
+> **AI-Assisted Project:** Developed with AI assistance. Code reviewed but not guaranteed production-ready.
+
+> [!NOTE]
+> **The original screencopy-based pipeline (`veil-compositor` / `veil-cli`) is discontinued.**
+> It has been archived to `archive-veil/`. All development is now on `veil-host`.
 
 ---
 
-## What it does
+## How it works
 
-Veil launches a GUI application, captures its frames from the Wayland compositor, and renders them into your terminal using half-block Unicode characters (`▀`) with 24-bit truecolor — doubling effective vertical resolution. Text from the accessibility tree (AT-SPI) is overlaid on top for readable labels and buttons.
+`veil-host` is a Smithay-based nested Wayland compositor. It:
 
-No VNC. No X forwarding. Just your terminal.
+1. Opens its own `WAYLAND_DISPLAY` socket
+2. Spawns the target app pointed at that socket
+3. Receives SHM buffer commits (shm path; GPU/dmabuf apps fall back to software automatically)
+4. Composites surfaces + subsurfaces + popups + cursor into a single RGBA frame
+5. Encodes and streams that frame to the terminal via Kitty graphics / half-block Unicode / ASCII
+
+Input flows back: keyboard, mouse (click, drag, scroll), and clipboard (both directions) are fully bridged.
 
 ---
 
 ## Architecture
 
-Multi-language workspace — each component uses the right tool for the job.
-
 ```
 veil/
-├── veil-cli/           Rust — CLI entrypoint, render loop, dirty-row output
-├── veil-compositor/    Rust — window detection, capture pipeline, AT-SPI
-│   ├── gui.rs              GuiCompositor: launch app, capture thread, IPC polling
-│   ├── wayland_capture.rs  zwlr_screencopy_manager_v1 client (Niri + Hyprland)
-│   ├── tui.rs              PTY compositor for terminal apps
-│   └── capture_shm.rs      SHM reader for LD_PRELOAD captured frames
-├── veil-render/        Rust — half-block colour renderer, luma/edge engine
-├── veil-config/        Rust — Lua config loader (mlua)
-├── veil-screencopy/    C — ext-image-copy-capture-v1 client (Hyprland, future)
-├── veil-capture/       Zig — LD_PRELOAD .so: intercepts wl_shm + EGL inside app
-└── atspi_query.py      Python — AT-SPI accessibility tree walker
+├── veil-host/      Smithay nested compositor + standalone binary
+│   ├── server.rs       Wayland globals, dispatch loop, software compositor
+│   ├── main.rs         Terminal I/O, render dispatch, CLI
+│   ├── input.rs        InputCmd enum
+│   └── sink.rs         Frame struct
+├── veil-render/    Render engines (kitty, halfblock, ascii, ascii-edge)
+├── veil-config/    Lua config loader + terminal auto-detection
+└── archive-veil/   Discontinued: old cage+screencopy+uinput pipeline
 ```
 
-### Capture priority chain
+### Compositor globals
 
-On each frame the compositor tries backends in order, falling through on failure:
-
-| Priority | Backend | How |
-|----------|---------|-----|
-| 1 | **SHM / LD_PRELOAD** | Zig `.so` injected via `LD_PRELOAD`; intercepts `wl_shm_create_pool` and `eglSwapBuffers`, writes frames to `/dev/shm/veil_<pid>` |
-| 2 | **wlr-screencopy** | Rust `WaylandCapture` using `zwlr_screencopy_manager_v1`; captures full output then crops to window bounds from compositor IPC |
-| 3 | **idle** | No backend available — logs and waits |
-
-Window coordinates are sourced from:
-- **Niri**: `niri msg --json windows` → `geometry.{x,y,width,height}`
-- **Hyprland**: `hyprctl clients -j` → `at`, `size`, `class`
-
-Window bounds are re-polled every 500 ms inside the capture thread — resize and move are tracked live.
-
-### Render pipeline
-
-```
-RGBA frame (physical px)
-  │
-  ├─ crop_rgba()           slice window region from full output
-  │
-  └─ rgba_to_halfblocks()  map to ColorCell grid (cols × rows)
-       │  ▀ top-half = fg RGB
-       │  ▀ bot-half = bg RGB
-       │  2× effective vertical resolution
-       │
-       └─ color_dirty_loop()  \x1b[38;2;R;G;Bm\x1b[48;2;R;G;Bm▀ per cell
-                               only redraws rows that changed
-```
-
-AT-SPI text overlay runs on a separate 500 ms thread and stamps readable strings over the grid.
+| Global | Status |
+|---|---|
+| `wl_compositor` + `wl_subcompositor` | ✓ full |
+| `xdg_shell` (toplevel + popup) | ✓ full |
+| `wl_seat` (keyboard, pointer, touch) | ✓ full |
+| `wl_shm` | ✓ full |
+| `wl_data_device_manager` (clipboard) | ✓ full |
+| `wl_output` + `xdg_output` | ✓ full |
+| `xdg_activation` | ✓ stub (always grant) |
+| `xdg_decoration` | ✓ client-side always |
+| `zwp_linux_dmabuf_v1` | stub — advertised, every import fails → shm fallback |
+| `wp_viewporter` / `wp_fractional_scale` / `wp_presentation_time` | globals only |
+| XWayland | ✓ spawned at startup, X11 apps work |
 
 ---
 
-## Compositor support
+## Install
 
-| Compositor | Window discovery | Screencopy |
-|------------|-----------------|------------|
-| **Niri** | `niri msg --json windows` | `zwlr_screencopy_manager_v1` ✓ |
-| **Hyprland** | `hyprctl clients -j` | `zwlr_screencopy_manager_v1` ✓ |
-
-`ext-image-copy-capture-v1` (`veil-screencopy` C binary) is built but removed from the active chain — `zwlr` covers both compositors.
-
----
-
-## Build
-
-Three build systems unified under one root Makefile: Cargo (Rust), Zig, and Make (C).
-
-**Requirements**
-
-- Rust stable toolchain
-- Zig 0.15+
-- `wayland-scanner`, `pkg-config`, `libwayland-client`
-- `python3` + `python-atspi` (`gi.repository.Atspi`)
-- Niri or Hyprland compositor at runtime
+### From a release (recommended)
 
 ```bash
-# Development build (unoptimised)
-make
+curl -fsSL https://raw.githubusercontent.com/viewerofall/veilTDC/main/install.sh | bash
+```
 
-# Release build — run as your user
-make release
+or with wget:
 
-# Install system-wide — run as root after make release
-sudo make install
+```bash
+wget -qO- https://raw.githubusercontent.com/viewerofall/veilTDC/main/install.sh | bash
+```
 
-# Install to ~/.local — no sudo needed
+Installs to `/usr/local/bin/veil-host` (uses `sudo` if needed). Supports `x86_64` and `aarch64`.
+
+Options:
+
+```bash
+# Install to ~/.local/bin (no sudo)
+INSTALL_DIR=~/.local/bin curl -fsSL .../install.sh | bash
+
+# Pin a specific version
+VERSION=v0.1.0 curl -fsSL .../install.sh | bash
+```
+
+### From source
+
+Requirements: Rust stable, a Wayland compositor running (Niri, Hyprland, etc.).
+
+```bash
+git clone https://github.com/viewerofall/veilTDC.git
+cd veilTDC
+
+# Build
+make release          # → target/release/veil-host
+
+# Install system-wide
+make release && sudo make install
+
+# Install to ~/.local (no sudo)
 make install-user
 
 # Uninstall
 sudo make uninstall
-
-# Clean all build artifacts
-make clean
-```
-
-Installed paths:
-
-```
-/usr/local/bin/veil
-/usr/local/bin/veil-screencopy
-/usr/local/lib/veil/libveil_capture.so
 ```
 
 ---
@@ -126,64 +110,82 @@ Installed paths:
 ## Usage
 
 ```bash
-# TUI / terminal app — full PTY passthrough
-veil run my-tui-app
+# Run any GUI app
+veil-host run thunar
+veil-host run firefox
+veil-host run weston-terminal
 
-# GUI app — captured and rendered in colour
-veil run-gui nautilus
-veil run-gui zen-browser
-veil run-gui kitty
+# Flags
+veil-host run -d thunar                  # debug log → /tmp/veil.log
+veil-host run -m halfblock thunar        # force render mode
+veil-host run -m ascii-edge thunar       # edge-detection ascii
+veil-host run -w 1920 -h 1080 thunar     # explicit compositor resolution
+veil-host run -s wayland-veil-1 thunar   # custom socket name
 
-# Override config at runtime
-veil run-gui --override fps=15 zen-browser
-
-# Show terminal info and active config
-veil probe
+# Probe terminal capabilities and resolved config
+veil-host probe
 ```
 
-Press `Ctrl+C` to exit and kill the launched application.
+The compositor size defaults to `terminal_cols × 8` × `terminal_rows × 16` (standard 8×16 cell assumption). Resize the terminal window and the compositor reconfigures live.
 
-### config.lua
+Press `Ctrl+C` to exit. veil-host shuts down automatically when the hosted app exits.
+
+---
+
+## Render modes
+
+| Mode | Flag | Terminal requirement | Notes |
+|---|---|---|---|
+| **Kitty** | `kitty` | Kitty graphics protocol | Best quality, native pixel output |
+| **Halfblock** | `halfblock` | 24-bit truecolor | `▀` Unicode, 2× effective vertical resolution |
+| **ASCII** | `ascii` | Any | Luma → ASCII character map |
+| **ASCII Edge** | `ascii-edge` | Any | Luma with hysteresis edge-detection for sharper output |
+
+Without `-m`, the mode is resolved automatically:
+
+1. Check `quality` in `config.lua`
+2. If `auto`, detect from `$TERM` / `$COLORTERM`:
+   - `xterm-kitty` or WezTerm → Kitty
+   - `truecolor` / `24bit` → Halfblock
+   - Otherwise → ASCII
+
+---
+
+## config.lua
+
+Place at `./config.lua` or `~/.config/veil/config.lua`.
 
 ```lua
-quality = "kitty"   -- terminal hint (informational)
-fps     = 30        -- target render FPS (capture runs at fps/2)
+quality = "auto"   -- auto | kitty | pixel | ascii | ascii_edge | ascii_luma
+fps     = 60       -- compositor frame rate cap
 ```
 
-Place in the working directory or pass `--config path/to/config.lua`.
+`veil-host probe` shows which config file was loaded and the resolved mode.
+
+---
+
+## Clipboard
+
+Full bidirectional bridge:
+
+- **App → host**: when the hosted app copies text, it appears in your host clipboard
+- **Host → app**: host clipboard is polled every second and offered to the hosted app when it has no active selection
 
 ---
 
 ## Limitations
 
-- **Terminal must support truecolor** — Kitty, Alacritty, foot, WezTerm, etc.
-- **No input forwarding** — keyboard and mouse events are not sent to the rendered app
-- **AT-SPI text overlay** — runs but only applied on the TUI render path currently
-- **SHM/LD_PRELOAD** (`libveil_capture.so`) — EGL interception built but not fully wired into the pipeline yet
-- **veil-screencopy** — compiled and installed, not used in the active capture chain (kept for future `ext-image-copy-capture-v1` support)
+- **dmabuf / GPU import** — Chromium, Electron, Firefox require `zwp_linux_dmabuf_v1` with real GBM/EGL import. Planned for v1.5. For now, set `LIBGL_ALWAYS_SOFTWARE=1` (done automatically) to push them to shm.
+- **Single app** — one toplevel client per compositor instance. Multi-app support is a v2 goal.
+- **Cell resolution mouse** — terminal mouse events are cell-granularity, not pixel-granularity.
 
 ---
 
-## Status
+## What's next
 
-**May 2026**
-
-- Full-colour half-block rendering (`▀` with 24-bit fg/bg, 2× vertical resolution) ✓
-- Window-only capture — full output captured, cropped to window bounds, no desktop bleed ✓
-- Live resize and move tracking via 500 ms IPC re-poll ✓
-- Niri and Hyprland compositor detection, per-compositor IPC ✓
-- `zwlr_screencopy_manager_v1` working on both compositors ✓
-- Multi-language build: Rust + C + Zig + Python under one Makefile ✓
-- LD_PRELOAD SHM frame injection (Zig) — built, priority 1 when `/dev/shm/veil_<pid>` exists ✓
-- AT-SPI text overlay thread ✓
-- grim dependency removed ✓
-
-**Planned**
-
-- Input forwarding (keyboard + mouse to captured app)
-- AT-SPI overlay on colour render path
-- Complete EGL interception pipeline (Zig)
-- Kitty Graphics Protocol render mode (native pixel output, no char mapping)
+- **v1.5** — real dmabuf import (GBM + EGL) for GPU apps
+- **v2** — multi-app support, `veil-cli` migration to consume veil-host
+- **Expansion** — Linux TTY / framebuffer sink, Sixel, iTerm2 protocol
 
 ---
 

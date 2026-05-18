@@ -17,6 +17,9 @@ pub enum InputCmd {
 
     /// Vertical scroll in discrete notches (+ = down).
     Scroll { v120: i32 },
+
+    /// Terminal window resized — new compositor output dimensions in pixels.
+    Resize { width: u32, height: u32 },
 }
 
 // TODO: routing layer that takes an InputCmd and calls into
