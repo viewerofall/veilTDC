@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -39,7 +39,7 @@ use smithay::{
     reexports::wayland_server::{
         backend::{ClientData, ClientId, DisconnectReason, ObjectId},
         protocol::{wl_buffer, wl_seat, wl_shm, wl_surface::WlSurface},
-        Client, Display, Resource,
+        Client, Display, DisplayHandle, Resource,
     },
     utils::{Serial, Transform},
     wayland::{
@@ -53,9 +53,10 @@ use smithay::{
         fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState},
         output::{OutputHandler, OutputManagerState},
         presentation::PresentationState,
-        selection::SelectionHandler,
+        selection::{SelectionHandler, SelectionSource, SelectionTarget},
         selection::data_device::{
             ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+            request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
         },
         shell::xdg::{
             decoration::{XdgDecorationHandler, XdgDecorationState},
@@ -111,6 +112,11 @@ pub struct State {
     pub frame_serial:      u64,
     pub running:           bool,
     pub start_time:        Instant,
+    pub display_handle:       DisplayHandle,
+    pub host_clipboard:       Option<String>,
+    pub clipboard_rx:         mpsc::Receiver<String>,
+    pub pending_copy_out:     bool,
+    pub client_has_selection: bool,
 }
 
 /// Per-surface RGBA cache entry. We re-blit these every dirty tick.
@@ -258,7 +264,10 @@ impl SeatHandler for State {
     type TouchFocus    = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> { &mut self.seat_state }
-    fn focus_changed(&mut self, _s: &Seat<Self>, _f: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        let client = focused.and_then(|s| s.client());
+        set_data_device_focus::<State>(&self.display_handle, seat, client);
+    }
     fn cursor_image(&mut self, _s: &Seat<Self>, image: CursorImageStatus) {
         self.cursor_status = image;
         self.dirty = true;
@@ -267,6 +276,26 @@ impl SeatHandler for State {
 
 impl SelectionHandler for State {
     type SelectionUserData = ();
+
+    fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, _seat: Seat<Self>) {
+        if ty != SelectionTarget::Clipboard { return; }
+        self.client_has_selection = source.is_some();
+        if source.is_some() {
+            // Schedule a deferred read: Smithay updates seat_data AFTER this callback returns,
+            // so we request the data on the next tick when seat_data is current.
+            self.pending_copy_out = true;
+        }
+    }
+
+    fn send_selection(&mut self, ty: SelectionTarget, _mime_type: String, fd: OwnedFd, _seat: Seat<Self>, _user_data: &()) {
+        if ty != SelectionTarget::Clipboard { return; }
+        let Some(text) = self.host_clipboard.clone() else { return; };
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let mut f: std::fs::File = fd.into();
+            let _ = f.write_all(text.as_bytes());
+        });
+    }
 }
 
 impl DataDeviceHandler for State {
@@ -722,6 +751,28 @@ pub fn run(
     output.set_preferred(mode);
     let _output_global = output.create_global::<State>(&dh);
 
+    // Clipboard: poll the host compositor for clipboard changes every second.
+    // Only offers host content when the hosted client has no active selection.
+    let (clipboard_tx, clipboard_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat as PasteSeat};
+        let mut last = String::new();
+        loop {
+            std::thread::sleep(Duration::from_millis(1000));
+            match get_contents(ClipboardType::Regular, PasteSeat::Unspecified, MimeType::Text) {
+                Ok((mut reader, _)) => {
+                    let mut text = String::new();
+                    if reader.read_to_string(&mut text).is_ok() && !text.is_empty() && text != last {
+                        last = text.clone();
+                        if clipboard_tx.send(text).is_err() { break; }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
     let state = State {
         compositor_state, xdg_shell_state, shm_state, seat_state,
         xdg_activation, output_manager,
@@ -743,6 +794,11 @@ pub fn run(
         frame_serial:   0,
         running:        true,
         start_time:     Instant::now(),
+        display_handle:       dh.clone(),
+        host_clipboard:       None,
+        clipboard_rx,
+        pending_copy_out:     false,
+        client_has_selection: false,
     };
 
     let mut data = LoopData { state, display };
@@ -814,6 +870,53 @@ pub fn run(
         // Drain input cmds.
         while let Ok(cmd) = input_rx.try_recv() {
             apply_input(&mut data.state, cmd);
+        }
+
+        // Copy-out: hosted client set clipboard → push to host compositor.
+        // Deferred one tick because Smithay updates seat_data after new_selection returns.
+        if data.state.pending_copy_out {
+            data.state.pending_copy_out = false;
+            let seat = data.state.seat.clone();
+            for &mime in &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"] {
+                let mut fds = [-1i32; 2];
+                let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == 0 };
+                if !ok { break; }
+                let read_fd  = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+                let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+                if request_data_device_client_selection::<State>(&seat, mime.to_string(), write_fd).is_ok() {
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let mut f: std::fs::File = read_fd.into();
+                        let mut buf = Vec::new();
+                        if f.read_to_end(&mut buf).is_err() || buf.is_empty() { return; }
+                        let _ = wl_clipboard_rs::copy::Options::new().copy(
+                            wl_clipboard_rs::copy::Source::Bytes(buf.into_boxed_slice()),
+                            wl_clipboard_rs::copy::MimeType::Text,
+                        );
+                    });
+                    break;
+                }
+                // read_fd closes here if request failed; write_fd was consumed by the call
+            }
+        }
+
+        // Paste-in: host clipboard changed → offer it to the hosted client.
+        // Only when the client has no active selection of its own.
+        if !data.state.client_has_selection {
+            let mut latest: Option<String> = None;
+            while let Ok(text) = data.state.clipboard_rx.try_recv() { latest = Some(text); }
+            if let Some(text) = latest {
+                if data.state.host_clipboard.as_deref() != Some(&text) {
+                    data.state.host_clipboard = Some(text);
+                    let dh = data.display.handle();
+                    let seat = data.state.seat.clone();
+                    set_data_device_selection::<State>(
+                        &dh, &seat,
+                        vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+                        (),
+                    );
+                }
+            }
         }
 
         // Composite all dirty surfaces into one RGBA frame and ship it.
