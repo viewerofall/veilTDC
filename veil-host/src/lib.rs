@@ -22,6 +22,7 @@ pub struct HostConfig {
     pub width:  u32,
     pub height: u32,
     pub spawn:  Option<Vec<String>>,
+    pub wayland_debug: bool,
 }
 
 /// Signal handle returned by [`Host::spawn`]; flip via [`Host::stop`]
@@ -36,6 +37,7 @@ impl Default for HostConfig {
             width:  1280,
             height: 720,
             spawn:  None,
+            wayland_debug: false,
         }
     }
 }
@@ -62,6 +64,7 @@ impl Host {
                     config.width,
                     config.height,
                     config.spawn,
+                    config.wayland_debug,
                     frame_tx,
                     input_rx,
                     stop_t,

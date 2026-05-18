@@ -16,7 +16,7 @@ use std::time::Duration;
 use crossterm::{
     cursor,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
@@ -43,7 +43,7 @@ fn main() -> std::io::Result<()> {
         if argv_seen_sep { spawn.push(a); continue; }
         match a.as_str() {
             "--" => argv_seen_sep = true,
-            "-d" | "--debug" => debug = true,
+            "-d" | "--debug" => { debug = true; cfg.wayland_debug = true; }
             "-w" | "--width"  => cfg.width  = args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.width),
             "-h" | "--height" => cfg.height = args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.height),
             "-m" | "--mode" => match args.next().as_deref() {
@@ -98,8 +98,12 @@ fn main() -> std::io::Result<()> {
         terminal::Clear(ClearType::All),
         cursor::Hide,
         cursor::MoveTo(0, 0),
-        EnableMouseCapture,
     )?;
+    // Enable only any-event + SGR mouse modes. EnableMouseCapture also enables
+    // ?1015h (URXVT extended) which causes kitty to send events in both URXVT
+    // and SGR encodings, making crossterm emit spurious duplicate button events
+    // (e.g. a physical left click arrives as Down(Left) + Down(Right)).
+    stdout.write_all(b"\x1b[?1003h\x1b[?1006h")?;
     let _guard = TermGuard;
 
     // ── input thread: read crossterm events, forward keys, watch for ctrl-c ──
@@ -111,6 +115,7 @@ fn main() -> std::io::Result<()> {
         std::thread::spawn(move || {
             eprintln!("[veil-host] input thread started");
             let mut tick = 0u32;
+            let mut btns = [false; 3];
             while running.load(Ordering::Relaxed) {
                 match event::poll(Duration::from_millis(100)) {
                     Ok(true)  => {}
@@ -132,7 +137,7 @@ fn main() -> std::io::Result<()> {
                                 break;
                             }
                             Event::Key(k) => forward_key(&input_tx, k),
-                            Event::Mouse(m) => forward_mouse(&input_tx, m, cols, rows, cw, ch),
+                            Event::Mouse(m) => forward_mouse(&input_tx, m, cols, rows, cw, ch, &mut btns),
                             _ => {}
                         }
                     }
@@ -249,7 +254,8 @@ impl Drop for TermGuard {
     fn drop(&mut self) {
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(KITTY_DELETE.as_bytes());
-        let _ = execute!(stdout, DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = stdout.write_all(b"\x1b[?1006l\x1b[?1003l");
+        let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -291,6 +297,7 @@ fn forward_mouse(
     m:  MouseEvent,
     cols: u16, rows: u16,
     comp_w: u32, comp_h: u32,
+    btns: &mut [bool; 3],
 ) {
     // Map terminal cell coords → compositor pixel coords. We use the
     // CENTER of the cell so clicks land where users visually aim.
@@ -302,11 +309,16 @@ fn forward_mouse(
             let _ = tx.send(InputCmd::PointerMotionAbs { x, y, width: comp_w, height: comp_h });
         }
         MouseEventKind::Down(b) => {
-            // Movement before the click so the surface knows where the click is.
+            let idx = btn_idx(b);
+            if btns[idx] { return; } // already down — spurious duplicate
+            btns[idx] = true;
             let _ = tx.send(InputCmd::PointerMotionAbs { x, y, width: comp_w, height: comp_h });
             let _ = tx.send(InputCmd::PointerButton { button: btn_code(b), pressed: true });
         }
         MouseEventKind::Up(b) => {
+            let idx = btn_idx(b);
+            if !btns[idx] { return; } // already up — spurious duplicate
+            btns[idx] = false;
             let _ = tx.send(InputCmd::PointerButton { button: btn_code(b), pressed: false });
         }
         MouseEventKind::ScrollDown => {
@@ -325,6 +337,14 @@ fn btn_code(b: MouseButton) -> u32 {
         MouseButton::Left   => 0x110, // BTN_LEFT
         MouseButton::Right  => 0x111, // BTN_RIGHT
         MouseButton::Middle => 0x112, // BTN_MIDDLE
+    }
+}
+
+fn btn_idx(b: MouseButton) -> usize {
+    match b {
+        MouseButton::Left   => 0,
+        MouseButton::Right  => 1,
+        MouseButton::Middle => 2,
     }
 }
 

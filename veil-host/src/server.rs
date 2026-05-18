@@ -23,8 +23,8 @@ use calloop::{
 };
 
 use smithay::{
-    delegate_compositor, delegate_dmabuf, delegate_fractional_scale, delegate_output,
-    delegate_presentation, delegate_seat, delegate_shm, delegate_viewporter,
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
+    delegate_output, delegate_presentation, delegate_seat, delegate_shm, delegate_viewporter,
     delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
@@ -54,6 +54,9 @@ use smithay::{
         output::{OutputHandler, OutputManagerState},
         presentation::PresentationState,
         selection::SelectionHandler,
+        selection::data_device::{
+            ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+        },
         shell::xdg::{
             decoration::{XdgDecorationHandler, XdgDecorationState},
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -83,6 +86,7 @@ pub struct State {
     pub output_manager:    OutputManagerState,
     pub dmabuf_state:      DmabufState,
     pub _dmabuf_global:    DmabufGlobal,
+    pub _data_device:      DataDeviceState,
     pub _xdg_decoration:   XdgDecorationState,
     pub _viewporter:       ViewporterState,
     pub _fractional:       FractionalScaleManagerState,
@@ -106,6 +110,7 @@ pub struct State {
     pub serial_counter:    u32,
     pub frame_serial:      u64,
     pub running:           bool,
+    pub start_time:        Instant,
 }
 
 /// Per-surface RGBA cache entry. We re-blit these every dirty tick.
@@ -167,9 +172,15 @@ impl CompositorHandler for State {
         match assign {
             Assign::New(buffer) => {
                 let result = with_buffer_contents(&buffer, |ptr, len, data| {
+                    tracing::info!("commit {} buf {}x{} fmt={:?}", surface.id(), data.width, data.height, data.format);
                     let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
                     shm_to_rgba(raw, &data)
                 });
+                match &result {
+                    Ok(None) => tracing::warn!("commit {} buf UNSUPPORTED FORMAT — skipping surface_buffers insert", surface.id()),
+                    Err(e)   => tracing::warn!("commit {} buf error: {:?}", surface.id(), e),
+                    Ok(Some((_, w, h))) => tracing::info!("commit {} → surface_buffers {}x{}", surface.id(), w, h),
+                }
                 if let Ok(Some((rgba, w, h))) = result {
                     self.surface_buffers.insert(
                         surface.id(),
@@ -258,6 +269,12 @@ impl SelectionHandler for State {
     type SelectionUserData = ();
 }
 
+impl DataDeviceHandler for State {
+    fn data_device_state(&self) -> &DataDeviceState { &self._data_device }
+}
+impl ClientDndGrabHandler for State {}
+impl ServerDndGrabHandler for State {}
+
 impl OutputHandler for State {}
 
 impl DmabufHandler for State {
@@ -319,6 +336,7 @@ impl XdgActivationHandler for State {
 }
 
 delegate_compositor!(State);
+delegate_data_device!(State);
 delegate_shm!(State);
 delegate_xdg_shell!(State);
 delegate_seat!(State);
@@ -475,6 +493,7 @@ fn composite_and_send(state: &mut State) {
     }
     state.last_composite = Some(now);
     state.dirty = false;
+    tracing::info!("compositing frame (buffers={})", state.surface_buffers.len());
 
     let w = state.output_w;
     let h = state.output_h;
@@ -560,17 +579,19 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
                 if xi >= bx && yi >= by
                     && xi < bx + buf.w as i32 && yi < by + buf.h as i32
                 {
-                    return Some((ps.clone(), (x - bx as f64, y - by as f64).into()));
+                    // loc = surface origin in compositor space; Smithay
+                    // computes surface-local as event.location - loc.
+                    return Some((ps.clone(), (bx as f64, by as f64).into()));
                 }
             }
         }
 
-        // Toplevel root (subsurfaces share its keyboard/pointer focus via the root).
+        // Toplevel root is at (0,0) in compositor space.
         if let Some(buf) = state.surface_buffers.get(&root.id()) {
             if xi >= 0 && yi >= 0
                 && xi < buf.w as i32 && yi < buf.h as i32
             {
-                return Some((root, (x, y).into()));
+                return Some((root, (0.0_f64, 0.0_f64).into()));
             }
         }
     }
@@ -580,7 +601,7 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
 fn apply_input(state: &mut State, cmd: InputCmd) {
     use smithay::backend::input::{ButtonState as BState, KeyState};
     let serial = state.next_serial();
-    let time   = 0u32;
+    let time   = state.start_time.elapsed().as_millis() as u32;
 
     match cmd {
         InputCmd::Key { keycode, pressed, .. } => {
@@ -603,6 +624,10 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             // Resolve focus: prefer the topmost popup under the cursor,
             // else the toplevel. Surface-local coords are (global - origin).
             let focus = pick_focus(state, nx, ny);
+            if focus.is_none() {
+                tracing::warn!("motion ({:.0},{:.0}) → no focus (toplevels={}, buffers={})",
+                    nx, ny, state.toplevels.len(), state.surface_buffers.len());
+            }
             let ptr = state.pointer.clone();
             ptr.motion(state, focus, &MotionEvent {
                 location: (nx, ny).into(), serial, time,
@@ -651,6 +676,7 @@ pub fn run(
     width:  u32,
     height: u32,
     spawn:  Option<Vec<String>>,
+    wayland_debug: bool,
     frame_tx: mpsc::Sender<Frame>,
     input_rx: mpsc::Receiver<InputCmd>,
     stop: Arc<AtomicBool>,
@@ -669,6 +695,7 @@ pub fn run(
     // via ImportNotifier::failed(), pushing them to shm fallback.
     let mut dmabuf_state = DmabufState::new();
     let _dmabuf_global   = dmabuf_state.create_global::<State>(&dh, std::iter::empty());
+    let _data_device     = DataDeviceState::new::<State>(&dh);
     let _xdg_decoration  = XdgDecorationState::new::<State>(&dh);
     let _viewporter      = ViewporterState::new::<State>(&dh);
     let _fractional      = FractionalScaleManagerState::new::<State>(&dh);
@@ -699,6 +726,7 @@ pub fn run(
         compositor_state, xdg_shell_state, shm_state, seat_state,
         xdg_activation, output_manager,
         dmabuf_state, _dmabuf_global,
+        _data_device,
         _xdg_decoration, _viewporter, _fractional, _presentation,
         seat, keyboard, pointer,
         output,
@@ -714,6 +742,7 @@ pub fn run(
         serial_counter: 0,
         frame_serial:   0,
         running:        true,
+        start_time:     Instant::now(),
     };
 
     let mut data = LoopData { state, display };
@@ -826,6 +855,9 @@ pub fn run(
             // they don't immediately die on missing dmabuf.
             cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
             cmd.env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            if wayland_debug {
+                cmd.env("WAYLAND_DEBUG", "1");
+            }
             match cmd.spawn() {
                 Ok(_)  => tracing::info!("spawned: {:?}", argv),
                 Err(e) => tracing::error!("spawn {:?} failed: {e}", argv),
