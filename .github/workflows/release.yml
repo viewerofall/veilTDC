@@ -11,24 +11,37 @@ on:
         required: true
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  build-x86_64:
+    name: Build x86_64
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            binary: veil-host-x86_64-unknown-linux-gnu
-          - target: aarch64-unknown-linux-gnu
-            binary: veil-host-aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
 
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: veil-host-x86_64-unknown-linux-gnu
+          path: target/release/veil-host
+
+  build-aarch64:
+    name: Build aarch64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-unknown-linux-gnu
 
       - name: Install cross
         uses: taiki-e/install-action@v2
@@ -36,26 +49,28 @@ jobs:
           tool: cross
 
       - name: Build
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/veil-host ${{ matrix.binary }}
+        run: cross build --release --target aarch64-unknown-linux-gnu
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.binary }}
-          path: ${{ matrix.binary }}
+          name: veil-host-aarch64-unknown-linux-gnu
+          path: target/aarch64-unknown-linux-gnu/release/veil-host
 
   release:
     name: Create Release
-    needs: build
+    needs: [build-x86_64, build-aarch64]
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+
+      - name: Rename binaries
+        run: |
+          mv veil-host veil-host-x86_64-unknown-linux-gnu 2>/dev/null || true
+          ls -la
 
       - name: Create release
         uses: softprops/action-gh-release@v2
