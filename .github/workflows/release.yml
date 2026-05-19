@@ -10,6 +10,9 @@ on:
         description: "Release title"
         required: true
 
+permissions:
+  contents: write
+
 jobs:
   build-x86_64:
     name: Build x86_64
@@ -26,11 +29,14 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Rename binary
+        run: cp target/release/veil-host veil-host-x86_64-unknown-linux-gnu
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: veil-host-x86_64-unknown-linux-gnu
-          path: target/release/veil-host
+          path: veil-host-x86_64-unknown-linux-gnu
 
   build-aarch64:
     name: Build aarch64
@@ -51,11 +57,14 @@ jobs:
       - name: Build
         run: cross build --release --target aarch64-unknown-linux-gnu
 
+      - name: Rename binary
+        run: cp target/aarch64-unknown-linux-gnu/release/veil-host veil-host-aarch64-unknown-linux-gnu
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: veil-host-aarch64-unknown-linux-gnu
-          path: target/aarch64-unknown-linux-gnu/release/veil-host
+          path: veil-host-aarch64-unknown-linux-gnu
 
   release:
     name: Create Release
@@ -66,11 +75,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-
-      - name: Rename binaries
-        run: |
-          mv veil-host veil-host-x86_64-unknown-linux-gnu 2>/dev/null || true
-          ls -la
 
       - name: Create release
         uses: softprops/action-gh-release@v2
