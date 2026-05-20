@@ -63,13 +63,13 @@ veil/
 ### From a release (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/viewerofall/veilTDC/main/install.sh | bash
+curl -fsSL https://viewerofall.pages.dev/install/veil/install.sh | bash
 ```
 
 or with wget:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/viewerofall/veilTDC/main/install.sh | bash
+wget -qO- https://viewerofall.pages.dev/install/veil/install.sh | bash
 ```
 
 Installs to `/usr/local/bin/veil-host` (uses `sudo` if needed). Supports `x86_64` and `aarch64`.
