@@ -8,7 +8,7 @@ Run any GUI app inside your terminal — full colour, live input, clipboard, res
 
 > [!NOTE]
 > **The original screencopy-based pipeline (`veil-compositor` / `veil-cli`) is discontinued.**
-> It has been archived to `archive-veil/`. All development is now on `veil-host`.
+> It has been archived on the [`legacy/v1`](../../tree/legacy/v1) branch — cage isolation, wlr-screencopy capture, halfblock renderer. All development is now on `veil-host`.
 
 ---
 
@@ -36,8 +36,7 @@ veil/
 │   ├── input.rs        InputCmd enum
 │   └── sink.rs         Frame struct
 ├── veil-render/    Render engines (kitty, halfblock, ascii, ascii-edge)
-├── veil-config/    Lua config loader + terminal auto-detection
-└── archive-veil/   Discontinued: old cage+screencopy+uinput pipeline
+└── veil-config/    Lua config loader + terminal auto-detection
 ```
 
 ### Compositor globals
@@ -93,16 +92,13 @@ git clone https://github.com/viewerofall/veilTDC.git
 cd veilTDC
 
 # Build
-make release          # → target/release/veil-host
+cargo build --release -p veil-host   # → target/release/veil-host
 
 # Install system-wide
-make release && sudo make install
+sudo install -Dm755 target/release/veil-host /usr/local/bin/veil-host
 
 # Install to ~/.local (no sudo)
-make install-user
-
-# Uninstall
-sudo make uninstall
+install -Dm755 target/release/veil-host ~/.local/bin/veil-host
 ```
 
 ---
