@@ -1,48 +1,35 @@
 //! Standalone runner: spawn a Wayland app inside veil-host and render
-//! its frames into the host terminal via the Kitty graphics protocol.
+//! its frames via auto-detected output backend (terminal or DRM/KMS).
 //!
 //! Usage:
-//!   veil-host -- weston-terminal
-//!   veil-host -d -- foot
-//!   veil-host wayland-veil-foo -- weston-terminal
+//!   veil-host run weston-terminal
+//!   veil-host run -d foot
+//!   veil-host run -s wayland-veil-0 firefox
 
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::{
-    cursor,
-    event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    },
-    execute,
-    terminal::{self, ClearType},
-};
-use std::fmt::Write as _;
-use veil_host::{Host, HostConfig, InputCmd};
-use veil_render::{rgba_to_halfblocks, compute_luma, luma_to_chars, apply_hysteresis, render_kitty_frame, KITTY_DELETE};
-use veil_config::{Quality, detect_quality};
-use veil_gpu::GpuEncoder;
+use veil_host::input_backend::{self, InputCtx, InputGeometry};
+use veil_host::{Host, HostConfig};
+use veil_config::detect_quality;
 
-#[derive(Copy, Clone, Debug)]
-enum RenderMode { Kitty, Halfblock, Ascii, AsciiEdge }
-
-fn quality_to_mode(q: Quality) -> RenderMode {
-    match q {
-        Quality::Kitty                => RenderMode::Kitty,
-        Quality::Pixel                => RenderMode::Halfblock,
-        Quality::AsciiLuma            => RenderMode::Ascii,
-        Quality::AsciiEdge            => RenderMode::AsciiEdge,
-        Quality::Sixel | Quality::Auto => RenderMode::Kitty,
-    }
-}
-
-const LOG_PATH: &str = "/tmp/veil.log";
 const VERSION: &str  = env!("CARGO_PKG_VERSION");
+
+/// Persistent debug-log path (NOT /tmp — that's tmpfs and is wiped by the
+/// reboot after a hard lock, taking the crash evidence with it).
+/// `$XDG_STATE_HOME/veil/veil.log`, falling back to `~/.local/state/...`.
+fn log_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            std::path::PathBuf::from(home).join(".local/state")
+        });
+    base.join("veil").join("veil.log")
+}
 
 fn print_help() {
     println!("veil-host {VERSION} — nested Wayland compositor → terminal renderer");
@@ -56,8 +43,10 @@ fn print_help() {
     println!("  list-modes                List all render modes and which one would be chosen");
     println!();
     println!("RUN FLAGS");
+    println!("  -a, --append              Add the app to an already-running veil instance");
+    println!("                            (launches against its socket; works cross-VT)");
     println!("  -m, --mode <mode>         Force a render mode (see list-modes for options)");
-    println!("  -d, --debug               Redirect all logs to /tmp/veil.log");
+    println!("  -d, --debug               Redirect all logs to $XDG_STATE_HOME/veil/veil.log");
     println!("  -w, --width <px>          Override compositor width  (default: cols × 8)");
     println!("  -h, --height <px>         Override compositor height (default: rows × 16)");
     println!("  -s, --socket <name>       Wayland socket name (default: wayland-veil-0)");
@@ -69,6 +58,7 @@ fn print_help() {
     println!();
     println!("EXAMPLES");
     println!("  veil-host run thunar");
+    println!("  veil-host run -a dolphin          # add to a running instance (any VT)");
     println!("  veil-host run -d -m halfblock firefox");
     println!("  veil-host run --stats nautilus");
     println!("  veil-host probe");
@@ -96,17 +86,16 @@ fn main() -> std::io::Result<()> {
     // ── `run` subcommand ──────────────────────────────────────────────────────
     let mut cfg        = HostConfig::default();
     let mut debug      = false;
-    let mut stats      = false;
-    let mut mode_override: Option<RenderMode> = None;
     let mut spawn: Vec<String> = Vec::new();
     let mut explicit_size = false;
+    let mut append     = false;
 
     while let Some(a) = raw_args.next() {
         if !spawn.is_empty() { spawn.push(a); continue; }
         match a.as_str() {
             "--help"          => { print_help(); return Ok(()); }
+            "-a" | "--append" => { append = true; }
             "-d" | "--debug"  => { debug = true; cfg.wayland_debug = true; }
-            "--stats"         => { stats = true; }
             "-w" | "--width"  => {
                 cfg.width = raw_args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.width);
                 explicit_size = true;
@@ -115,13 +104,6 @@ fn main() -> std::io::Result<()> {
                 cfg.height = raw_args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.height);
                 explicit_size = true;
             }
-            "-m" | "--mode" => match raw_args.next().as_deref() {
-                Some("kitty")      => mode_override = Some(RenderMode::Kitty),
-                Some("halfblock")  => mode_override = Some(RenderMode::Halfblock),
-                Some("ascii")      => mode_override = Some(RenderMode::Ascii),
-                Some("ascii-edge") => mode_override = Some(RenderMode::AsciiEdge),
-                other => { eprintln!("unknown mode: {other:?}\nrun 'veil-host --help' for usage"); std::process::exit(2); }
-            },
             "-s" | "--socket" => {
                 cfg.socket_name = raw_args.next().unwrap_or_else(|| { eprintln!("--socket requires a value"); std::process::exit(2); });
             }
@@ -130,34 +112,26 @@ fn main() -> std::io::Result<()> {
         }
     }
     if spawn.is_empty() { eprintln!("error: 'run' requires a command\nrun 'veil-host --help' for usage"); std::process::exit(2); }
+
+    // --append: don't start a compositor — launch the app against an
+    // already-running veil instance's socket and exit. Works cross-VT because
+    // the socket lives in the shared per-user $XDG_RUNTIME_DIR.
+    if append {
+        if let Err(e) = attach(&cfg.socket_name, &spawn) {
+            eprintln!("[veil-host] {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     cfg.spawn = Some(spawn);
 
-    // Load config.lua — ./config.lua then ~/.config/veil/config.lua.
-    let vcfg = [
-        std::path::PathBuf::from("config.lua"),
-        dirs_config().join("config.lua"),
-    ]
-    .iter()
-    .find(|p| p.exists())
-    .map(|p| veil_config::load(p))
-    .unwrap_or_default();
-
-    // Render mode: CLI flag wins, then config quality, then auto-detect.
-    let mode = mode_override.unwrap_or_else(|| {
-        let q = if vcfg.quality == veil_config::Quality::Auto {
-            detect_quality()
-        } else {
-            vcfg.quality.clone()
-        };
-        quality_to_mode(q)
-    });
-
-    cfg.fps = vcfg.fps;
-    let use_gpu = vcfg.gpu_render;
+    // ── Debug mode: redirect stderr into the persistent log so it doesn't corrupt output.
+    if debug { init_debug_log()?; }
+    init_tracing(debug);
 
     // Size compositor to match actual terminal pixel area unless user gave explicit dims.
     // Assume 8×16 px per cell — the most common monospace glyph box.
-    let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     if !explicit_size {
         if let Some((pw, ph)) = term_pixel_size() {
             cfg.width  = pw;
@@ -168,21 +142,16 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // ── Debug mode: redirect stderr into /tmp/veil.log so it doesn't corrupt
-    //    kitty graphics on stdout.
-    if debug { init_debug_log()?; }
-    init_tracing(debug);
-
     eprintln!(
-        "[veil-host] socket={} size={}x{} spawn={:?} debug={} mode={:?}",
-        cfg.socket_name, cfg.width, cfg.height, cfg.spawn, debug, mode
+        "[veil-host] socket={} size={}x{} spawn={:?} debug={}",
+        cfg.socket_name, cfg.width, cfg.height, cfg.spawn, debug
     );
 
     let comp_w = cfg.width;
     let comp_h = cfg.height;
-    // Track current compositor dims — updated on resize events.
-    let cur_w = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(comp_w));
-    let cur_h = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(comp_h));
+    // Shared geometry for pointer mapping — updated on resize events.
+    let (init_cols, init_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let geom = InputGeometry::new(init_cols, init_rows, comp_w, comp_h);
     let host   = Host::spawn(cfg)?;
 
     // ── SIGINT handler: if ctrl-c slips past raw mode (eg. via `kill -INT`
@@ -192,110 +161,47 @@ fn main() -> std::io::Result<()> {
         let r = running.clone();
         let s = host.stop_flag();
         let _ = ctrlc_set(move || {
+            // Restore the console immediately in case clean teardown stalls —
+            // a wedged frame loop must never leave the VT black.
+            veil_host::vt::emergency_restore();
             r.store(false, Ordering::Relaxed);
             s.store(true, Ordering::Relaxed);
         });
     }
 
-    // ── terminal setup ────────────────────────────────────────────────────────
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let mut stdout = std::io::stdout();
-    terminal::enable_raw_mode()?;
-    execute!(
-        stdout,
-        terminal::EnterAlternateScreen,
-        terminal::Clear(ClearType::All),
-        cursor::Hide,
-        cursor::MoveTo(0, 0),
-    )?;
-    // Enable only any-event + SGR mouse modes. EnableMouseCapture also enables
-    // ?1015h (URXVT extended) which causes kitty to send events in both URXVT
-    // and SGR encodings, making crossterm emit spurious duplicate button events
-    // (e.g. a physical left click arrives as Down(Left) + Down(Right)).
-    stdout.write_all(b"\x1b[?1003h\x1b[?1006h")?;
-    let _guard = TermGuard;
-
-    // ── input thread: read crossterm events, forward keys, watch for ctrl-c ──
+    // ── input thread: auto-detected backend (crossterm terminal | evdev TTY).
+    //    Terminal setup is handled by TerminalOutput when in terminal mode.
     {
-        let running   = running.clone();
-        let host_stop = host.stop_flag();
-        let input_tx  = host.input_sender();
-        let cur_w_t   = cur_w.clone();
-        let cur_h_t   = cur_h.clone();
-        std::thread::spawn(move || {
-            eprintln!("[veil-host] input thread started");
-            let mut tick = 0u32;
-            let mut btns = [false; 3];
-            let mut held_keys = std::collections::HashSet::<u32>::new();
-            // Mutable local copies — updated on every Resize event so mouse
-            // mapping stays correct after the terminal window is resized.
-            let mut cur_cols = cols;
-            let mut cur_rows = rows;
-            let mut last_event_time = std::time::Instant::now();
-            while running.load(Ordering::Relaxed) {
-                match event::poll(Duration::from_millis(1)) {
-                    Ok(true)  => { last_event_time = std::time::Instant::now(); }
-                    Ok(false) => {
-                        tick = tick.wrapping_add(1);
-                        // Log idle every 30s based on wall time, not poll ticks.
-                        let idle_secs = last_event_time.elapsed().as_secs();
-                        if idle_secs > 0 && tick % 30_000 == 0 {
-                            eprintln!("[veil-host] input idle {}s", idle_secs);
-                        }
-                        continue;
-                    }
-                    Err(e) => { eprintln!("[veil-host] poll error: {e}"); continue; }
-                }
-                match event::read() {
-                    Ok(ev) => {
-                        tracing::debug!("event: {ev:?}");
-                        match ev {
-                            Event::Key(k) if is_ctrl_c(&k) => {
-                                eprintln!("[veil-host] ctrl-c → shutdown");
-                                running.store(false, Ordering::Relaxed);
-                                host_stop.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                            Event::Key(k) => forward_key(&input_tx, k, &mut held_keys),
-                            Event::Mouse(m) => {
-                                let cw = cur_w_t.load(std::sync::atomic::Ordering::Relaxed);
-                                let ch = cur_h_t.load(std::sync::atomic::Ordering::Relaxed);
-                                forward_mouse(&input_tx, m, cur_cols, cur_rows, cw, ch, &mut btns);
-                            }
-                            Event::Resize(new_cols, new_rows) => {
-                                cur_cols = new_cols;
-                                cur_rows = new_rows;
-                                let (nw, nh) = term_pixel_size()
-                                    .unwrap_or((new_cols as u32 * 8, new_rows as u32 * 16));
-                                cur_w_t.store(nw, std::sync::atomic::Ordering::Relaxed);
-                                cur_h_t.store(nh, std::sync::atomic::Ordering::Relaxed);
-                                let _ = input_tx.send(InputCmd::Resize { width: nw, height: nh });
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(e) => eprintln!("[veil-host] read error: {e}"),
-                }
-            }
-            eprintln!("[veil-host] input thread exited");
-        });
+        let backend = input_backend::detect();
+        let ctx = InputCtx {
+            tx:        host.input_sender(),
+            running:   running.clone(),
+            host_stop: host.stop_flag(),
+            geom:      geom.clone(),
+        };
+        std::thread::spawn(move || backend.run(ctx));
     }
 
-    // ── GPU encoder (optional, config-controlled) ─────────────────────────────
-    let gpu: Option<GpuEncoder> = if use_gpu && !matches!(mode, RenderMode::Kitty) {
-        match GpuEncoder::new() {
-            Some(g) => { eprintln!("[veil-host] GPU encoder active"); Some(g) }
-            None    => { eprintln!("[veil-host] GPU encoder unavailable, falling back to CPU"); None }
-        }
-    } else {
-        None
-    };
+    // ── Create output backend (auto-detect terminal vs DRM/KMS) ────────────────
+    let mut output = veil_host::output::detect()?;
+    let (out_w, out_h) = output.get_size();
+    eprintln!("[veil-host] output backend initialized: {}x{}", out_w, out_h);
+
+    // If the output (e.g. DRM display mode) differs from the size the
+    // compositor was spawned at, retarget it so frames arrive at native res
+    // instead of being clipped/letterboxed.
+    if (out_w, out_h) != (comp_w, comp_h) {
+        geom.comp_w.store(out_w, Ordering::Relaxed);
+        geom.comp_h.store(out_h, Ordering::Relaxed);
+        let _ = host.input_sender().send(
+            veil_host::InputCmd::Resize { width: out_w, height: out_h },
+        );
+        eprintln!("[veil-host] retargeting compositor to output size {out_w}x{out_h}");
+    }
 
     // ── frame loop ────────────────────────────────────────────────────────────
-    let mut stable_luma: Vec<u8> = Vec::new();
     let mut fps_frame_count = 0u32;
     let mut fps_last        = std::time::Instant::now();
-    let mut fps_display     = 0.0f32;
 
     while running.load(Ordering::Relaxed) {
         let mut frame = match host.frames().recv_timeout(Duration::from_millis(200)) {
@@ -306,75 +212,67 @@ fn main() -> std::io::Result<()> {
         // Drain the channel — skip to latest frame if compositor is ahead.
         while let Ok(f) = host.frames().try_recv() { frame = f; }
 
-        // Re-read terminal size each frame so rendering stays in sync after resize.
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        // Stats bar lives on the bottom row; shrink render area by 1 when active.
-        let usable_rows = rows.saturating_sub(if stats { 2 } else { 1 });
+        // Render via output backend
+        output.render_frame(&frame.rgba, frame.width, frame.height)?;
 
-        let out = match mode {
-            RenderMode::Kitty => {
-                // Kitty sends raw RGBA — GPU has no encoding work to do here.
-                let mut s = String::new();
-                let _ = write!(s, "\x1b[H");
-                s.push_str(&render_kitty_frame(&frame.rgba, frame.width, frame.height, cols, usable_rows));
-                s
-            }
-            RenderMode::Halfblock => {
-                let cells = if let Some(ref g) = gpu {
-                    g.encode_halfblock(&frame.rgba, frame.width, frame.height, cols, usable_rows)
-                } else {
-                    rgba_to_halfblocks(&frame.rgba, frame.width, frame.height, cols, usable_rows)
-                };
-                emit_halfblocks(&cells, cols, usable_rows)
-            }
-            RenderMode::Ascii => {
-                let luma = if let Some(ref g) = gpu {
-                    g.encode_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows)
-                } else {
-                    compute_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows)
-                };
-                let chars = luma_to_chars(&luma, cols, usable_rows);
-                emit_chars(&chars, cols, usable_rows)
-            }
-            RenderMode::AsciiEdge => {
-                let luma = if let Some(ref g) = gpu {
-                    g.encode_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows)
-                } else {
-                    compute_luma(&frame.rgba, frame.width, frame.height, cols, usable_rows)
-                };
-                if stable_luma.len() != luma.len() { stable_luma = luma.clone(); }
-                apply_hysteresis(&mut stable_luma, &luma, 10);
-                let chars = luma_to_chars(&stable_luma, cols, usable_rows);
-                emit_chars(&chars, cols, usable_rows)
-            }
-        };
-        stdout.write_all(out.as_bytes())?;
-
-        // Stats bar — bottom row, dim text, no flicker on the render area.
-        if stats {
-            fps_frame_count += 1;
-            let elapsed = fps_last.elapsed();
-            if elapsed.as_secs_f32() >= 1.0 {
-                fps_display     = fps_frame_count as f32 / elapsed.as_secs_f32();
-                fps_frame_count = 0;
-                fps_last        = std::time::Instant::now();
-            }
-            let mode_name = match mode {
-                RenderMode::Kitty     => "kitty",
-                RenderMode::Halfblock => "halfblock",
-                RenderMode::Ascii     => "ascii",
-                RenderMode::AsciiEdge => "ascii-edge",
-            };
-            let bar = format!(
-                "\x1b[{};1H\x1b[2K\x1b[90m veil-host {VERSION}  fps:{:.0}  compositor:{}x{}px  mode:{}  terminal:{}x{} \x1b[0m",
-                rows, fps_display, frame.width, frame.height, mode_name, cols, rows,
-            );
-            stdout.write_all(bar.as_bytes())?;
+        // FPS stats logging every second
+        fps_frame_count += 1;
+        let elapsed = fps_last.elapsed();
+        if elapsed.as_secs_f32() >= 1.0 {
+            let fps = fps_frame_count as f32 / elapsed.as_secs_f32();
+            eprintln!("[veil-host] fps: {:.0}  compositor: {}x{}px", fps, frame.width, frame.height);
+            fps_frame_count = 0;
+            fps_last = std::time::Instant::now();
         }
-
-        stdout.flush()?;
     }
 
+    Ok(())
+}
+
+/// Launch `argv` as a client of an already-running veil instance, then return.
+/// No IPC with the running process — we just exec the app pointed at its
+/// Wayland socket in `$XDG_RUNTIME_DIR`, detached from this TTY's session so it
+/// survives when this shell exits (the veil instance may be on another VT).
+fn attach(socket: &str, argv: &[String]) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let runtime = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "XDG_RUNTIME_DIR unset — can't locate the veil socket",
+        )
+    })?;
+    let sock_path = std::path::Path::new(&runtime).join(socket);
+    // Probe by actually connecting — a stale socket file from an exited
+    // instance still passes an existence check but isn't listening. If we
+    // can't connect, there's no live instance to attach to (so we don't
+    // launch a client into the void, where it may fall back to X11).
+    if let Err(e) = std::os::unix::net::UnixStream::connect(&sock_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            format!(
+                "no live veil instance at {} ({e}) — start one with `veil-host run …` first",
+                sock_path.display()
+            ),
+        ));
+    }
+
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd.env("WAYLAND_DISPLAY", socket);
+    // Detach into a new session: no controlling TTY, so closing this shell
+    // won't SIGHUP the client. It's reparented to init and belongs to veil now.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().map_err(|e| {
+        std::io::Error::new(e.kind(), format!("spawn {:?}: {e}", argv[0]))
+    })?;
+    println!("[veil-host] attached {argv:?} (pid {}) → {socket}", child.id());
     Ok(())
 }
 
@@ -402,20 +300,19 @@ fn dirs_config() -> std::path::PathBuf {
 
 fn cmd_list_modes() {
     let detected = detect_quality();
-    let auto_mode = quality_to_mode(detected.clone());
 
     println!("RENDER MODES");
     println!();
 
     let modes = [
-        ("kitty",      RenderMode::Kitty,     "Kitty Graphics Protocol — native pixel images, best quality",        "$TERM=xterm-kitty or WezTerm"),
-        ("halfblock",  RenderMode::Halfblock,  "Unicode ▀ half-blocks with 24-bit truecolor, 2× vertical res",      "$COLORTERM=truecolor or 24bit"),
-        ("ascii",      RenderMode::Ascii,      "Luma-mapped ASCII characters, works in any terminal",               "any"),
-        ("ascii-edge", RenderMode::AsciiEdge,  "Luma with hysteresis edge-detection, sharper than ascii",           "any"),
+        ("kitty",      "Kitty Graphics Protocol — native pixel images, best quality",        "$TERM=xterm-kitty or WezTerm"),
+        ("halfblock",  "Unicode ▀ half-blocks with 24-bit truecolor, 2× vertical res",      "$COLORTERM=truecolor or 24bit"),
+        ("ascii",      "Luma-mapped ASCII characters, works in any terminal",               "any"),
+        ("ascii-edge", "Luma with hysteresis edge-detection, sharper than ascii",           "any"),
     ];
 
-    for (name, variant, desc, req) in &modes {
-        let marker = if std::mem::discriminant(variant) == std::mem::discriminant(&auto_mode) {
+    for (name, desc, req) in &modes {
+        let marker = if name == &detected.as_str() {
             " ◀ auto-selected"
         } else {
             ""
@@ -425,13 +322,13 @@ fn cmd_list_modes() {
         println!();
     }
 
-    println!("Use -m <mode> to override.  Auto-detection is based on $TERM / $COLORTERM.");
+    println!("Output backend auto-detects based on environment (terminal vs DRM/KMS).");
 }
 
 // ─── probe ────────────────────────────────────────────────────────────────────
 
 fn cmd_probe() -> std::io::Result<()> {
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let pixel_dims = term_pixel_size();
     let (comp_w, comp_h) = pixel_dims.unwrap_or((cols as u32 * 8, rows as u32 * 16));
     let pixel_source = if pixel_dims.is_some() { "TIOCGWINSZ" } else { "cols×8, rows×16 (estimate)" };
@@ -454,21 +351,22 @@ fn cmd_probe() -> std::io::Result<()> {
         .unwrap_or_default();
 
     let detected   = detect_quality();
-    let resolved   = vcfg.resolved_quality();
-    let final_mode = quality_to_mode(resolved.clone());
+    let ssh_mode = std::env::var("SSH_CLIENT").is_ok() || std::env::var("SSH_TTY").is_ok();
+    let compositor_mode = wayland != "unset" || display != "unset";
 
     println!("terminal        : {term}");
     println!("colorterm       : {colorterm}");
     println!("term size       : {cols}x{rows} cells");
     println!("compositor      : {comp_w}x{comp_h} px  ({pixel_source})");
-    println!("detected quality: {:?}", detected);
-    println!("config quality  : {:?}", vcfg.quality);
-    println!("resolved mode   : {final_mode:?}");
+    println!("detected quality: {detected:?}");
+    println!("config quality  : {}", format!("{:?}", vcfg.quality));
     println!("fps             : {}", vcfg.fps);
     println!("gpu_render      : {}", if vcfg.gpu_render { "on (default)" } else { "off" });
     println!("config file     : {}", config_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (using defaults)".into()));
     println!("WAYLAND_DISPLAY : {wayland}");
     println!("DISPLAY         : {display}");
+    println!("SSH_CLIENT      : {}", if ssh_mode { "yes (using terminal output)" } else { "no" });
+    println!("output backend  : {}", if compositor_mode || ssh_mode { "terminal" } else { "DRM/KMS (if available)" });
     println!("socket (default): wayland-veil-0");
     Ok(())
 }
@@ -503,7 +401,11 @@ fn ctrlc_set<F: FnMut() + Send + 'static>(mut f: F) -> std::io::Result<()> {
 // ─── debug log ────────────────────────────────────────────────────────────────
 
 fn init_debug_log() -> std::io::Result<()> {
-    let f = OpenOptions::new().create(true).append(true).open(LOG_PATH)?;
+    let path = log_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let f = OpenOptions::new().create(true).append(true).open(&path)?;
     let fd = f.as_raw_fd();
     unsafe {
         // Redirect fd 2 (stderr) into the log file. We deliberately leak the
@@ -513,7 +415,7 @@ fn init_debug_log() -> std::io::Result<()> {
         }
     }
     std::mem::forget(f);
-    eprintln!("\n[veil-host] ── debug log opened ──");
+    eprintln!("\n[veil-host] ── debug log opened ── ({})", path.display());
     Ok(())
 }
 
@@ -536,218 +438,3 @@ fn init_tracing(debug: bool) {
     });
 }
 
-// ─── terminal guard ───────────────────────────────────────────────────────────
-
-struct TermGuard;
-impl Drop for TermGuard {
-    fn drop(&mut self) {
-        let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(KITTY_DELETE.as_bytes());
-        let _ = stdout.write_all(b"\x1b[?1006l\x1b[?1003l");
-        let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
-    }
-}
-
-// ─── renderers ────────────────────────────────────────────────────────────────
-
-fn emit_halfblocks(cells: &[veil_render::ColorCell], cols: u16, rows: u16) -> String {
-    let mut s = String::with_capacity(cells.len() * 40);
-    for row in 0..rows as usize {
-        let _ = write!(s, "\x1b[{};1H", row + 1);
-        for col in 0..cols as usize {
-            let c = &cells[row * cols as usize + col];
-            let _ = write!(
-                s,
-                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
-                c.fg[0], c.fg[1], c.fg[2], c.bg[0], c.bg[1], c.bg[2]
-            );
-        }
-    }
-    s.push_str("\x1b[0m");
-    s
-}
-
-fn emit_chars(chars: &[char], cols: u16, rows: u16) -> String {
-    let mut s = String::with_capacity(chars.len() + rows as usize * 8);
-    for row in 0..rows as usize {
-        let _ = write!(s, "\x1b[{};1H", row + 1);
-        for col in 0..cols as usize {
-            s.push(chars[row * cols as usize + col]);
-        }
-    }
-    s
-}
-
-// ─── mouse forwarding ─────────────────────────────────────────────────────────
-
-fn forward_mouse(
-    tx: &std::sync::mpsc::Sender<InputCmd>,
-    m:  MouseEvent,
-    cols: u16, rows: u16,
-    comp_w: u32, comp_h: u32,
-    btns: &mut [bool; 3],
-) {
-    // Map terminal cell coords → compositor pixel coords. We use the
-    // CENTER of the cell so clicks land where users visually aim.
-    let x = ((m.column as u32 * 2 + 1) * comp_w / (2 * cols.max(1) as u32)) as i32;
-    let y = ((m.row    as u32 * 2 + 1) * comp_h / (2 * rows.max(1) as u32)) as i32;
-
-    match m.kind {
-        MouseEventKind::Moved | MouseEventKind::Drag(_) => {
-            let _ = tx.send(InputCmd::PointerMotionAbs { x, y, width: comp_w, height: comp_h });
-        }
-        MouseEventKind::Down(b) => {
-            let idx = btn_idx(b);
-            if btns[idx] { return; } // already down — spurious duplicate
-            btns[idx] = true;
-            let _ = tx.send(InputCmd::PointerMotionAbs { x, y, width: comp_w, height: comp_h });
-            let _ = tx.send(InputCmd::PointerButton { button: btn_code(b), pressed: true });
-        }
-        MouseEventKind::Up(b) => {
-            let idx = btn_idx(b);
-            if !btns[idx] { return; } // already up — spurious duplicate
-            btns[idx] = false;
-            let _ = tx.send(InputCmd::PointerButton { button: btn_code(b), pressed: false });
-        }
-        MouseEventKind::ScrollDown => {
-            let _ = tx.send(InputCmd::Scroll { v120:  120 });
-        }
-        MouseEventKind::ScrollUp => {
-            let _ = tx.send(InputCmd::Scroll { v120: -120 });
-        }
-        _ => {}
-    }
-}
-
-// evdev BTN_* codes from linux/input-event-codes.h
-fn btn_code(b: MouseButton) -> u32 {
-    match b {
-        MouseButton::Left   => 0x110, // BTN_LEFT
-        MouseButton::Right  => 0x111, // BTN_RIGHT
-        MouseButton::Middle => 0x112, // BTN_MIDDLE
-    }
-}
-
-fn btn_idx(b: MouseButton) -> usize {
-    match b {
-        MouseButton::Left   => 0,
-        MouseButton::Right  => 1,
-        MouseButton::Middle => 2,
-    }
-}
-
-// ─── key forwarding ───────────────────────────────────────────────────────────
-
-fn is_ctrl_c(k: &KeyEvent) -> bool {
-    matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-/// Map crossterm KeyEvent → evdev keycode, forward to host with proper hold/release tracking.
-///
-/// Terminals supporting the kitty keyboard protocol emit Press, Repeat, Release.
-/// Dumb terminals only emit Press. The held set lets us tell the difference:
-/// a Press for a key already in held = dumb-terminal repeat → synthesize a tap.
-fn forward_key(
-    tx:   &std::sync::mpsc::Sender<InputCmd>,
-    k:    KeyEvent,
-    held: &mut std::collections::HashSet<u32>,
-) {
-    let keycode = match keycode_for(k.code) {
-        Some(c) => c,
-        None => return,
-    };
-    let shift = needs_shift(k.code) || k.modifiers.contains(KeyModifiers::SHIFT);
-    let ctrl  = k.modifiers.contains(KeyModifiers::CONTROL);
-    let alt   = k.modifiers.contains(KeyModifiers::ALT);
-
-    match k.kind {
-        KeyEventKind::Repeat => {
-            // Key is physically held — the Wayland client drives repeat via
-            // wl_keyboard.repeat_info, so we don't need to resend anything.
-        }
-        KeyEventKind::Release => {
-            if held.remove(&keycode) {
-                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: false });
-                if alt   { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: false }); }
-                if ctrl  { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: false }); }
-                if shift { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: false }); }
-            }
-        }
-        _ => {
-            // Press (or unknown — dumb terminal that never sends Release).
-            if !held.contains(&keycode) {
-                // First press: hold the key so the client's repeat timer fires.
-                held.insert(keycode);
-                if shift { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: true }); }
-                if ctrl  { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: true }); }
-                if alt   { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: true }); }
-                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: true });
-            } else {
-                // Dumb-terminal repeat: synthesize a tap without touching modifiers
-                // (they're already held from the original press).
-                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: true });
-                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: false });
-            }
-        }
-    }
-}
-
-fn needs_shift(code: KeyCode) -> bool {
-    match code {
-        KeyCode::Char(c) if c.is_ascii_uppercase() => true,
-        KeyCode::Char(c) => matches!(
-            c, '!'|'@'|'#'|'$'|'%'|'^'|'&'|'*'|'('|')'|'_'|'+'|'{'|'}'|'|'|':'|'"'|'<'|'>'|'?'|'~'
-        ),
-        _ => false,
-    }
-}
-
-// evdev keycodes (linux/input-event-codes.h).
-const KEY_LEFTCTRL:  u32 = 29;
-const KEY_LEFTSHIFT: u32 = 42;
-const KEY_LEFTALT:   u32 = 56;
-
-fn keycode_for(code: KeyCode) -> Option<u32> {
-    Some(match code {
-        KeyCode::Char(c) => match c.to_ascii_lowercase() {
-            'a' => 30, 'b' => 48, 'c' => 46, 'd' => 32, 'e' => 18, 'f' => 33,
-            'g' => 34, 'h' => 35, 'i' => 23, 'j' => 36, 'k' => 37, 'l' => 38,
-            'm' => 50, 'n' => 49, 'o' => 24, 'p' => 25, 'q' => 16, 'r' => 19,
-            's' => 31, 't' => 20, 'u' => 22, 'v' => 47, 'w' => 17, 'x' => 45,
-            'y' => 21, 'z' => 44,
-            '1' | '!' =>  2, '2' | '@' =>  3, '3' | '#' =>  4, '4' | '$' =>  5,
-            '5' | '%' =>  6, '6' | '^' =>  7, '7' | '&' =>  8, '8' | '*' =>  9,
-            '9' | '(' => 10, '0' | ')' => 11,
-            '-' | '_' => 12, '=' | '+' => 13,
-            '[' | '{' => 26, ']' | '}' => 27,
-            '\\'| '|' => 43,
-            ';' | ':' => 39, '\''| '"' => 40,
-            ',' | '<' => 51, '.' | '>' => 52, '/' | '?' => 53,
-            '`' | '~' => 41,
-            ' ' => 57,
-            _ => return None,
-        },
-        KeyCode::Enter     => 28,
-        KeyCode::Esc       => 1,
-        KeyCode::Backspace => 14,
-        KeyCode::Tab       => 15,
-        KeyCode::Left      => 105,
-        KeyCode::Right     => 106,
-        KeyCode::Up        => 103,
-        KeyCode::Down      => 108,
-        KeyCode::Home      => 102,
-        KeyCode::End       => 107,
-        KeyCode::PageUp    => 104,
-        KeyCode::PageDown  => 109,
-        KeyCode::Insert    => 110,
-        KeyCode::Delete    => 111,
-        KeyCode::F(n) => match n {
-            1..=10 => 58 + n as u32,        // F1=59 .. F10=68
-            11     => 87,
-            12     => 88,
-            _ => return None,
-        },
-        _ => return None,
-    })
-}

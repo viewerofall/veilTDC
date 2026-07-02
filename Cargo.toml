@@ -20,3 +20,5 @@ flate2                = "1.1"
 smithay               = { version = "0.7", default-features = false, features = ["wayland_frontend", "xwayland", "desktop"] }
 calloop               = "0.14"
 tracing               = "0.1"
+drm                   = "0.15"
+libseat               = "0.2"

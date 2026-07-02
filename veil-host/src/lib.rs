@@ -11,11 +11,18 @@ use std::sync::mpsc;
 use std::thread;
 
 pub mod input;
+pub mod input_backend;
+pub mod layout;
 pub mod server;
 pub mod sink;
+pub mod output;
+pub mod seat;
+pub mod vt;
 
 pub use input::InputCmd;
+pub use input_backend::{InputBackend, InputCtx, InputGeometry};
 pub use sink::Frame;
+pub use output::OutputBackend;
 
 pub struct HostConfig {
     pub socket_name:   String,

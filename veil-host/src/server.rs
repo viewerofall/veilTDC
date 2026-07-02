@@ -94,6 +94,7 @@ use smithay::backend::allocator::{
 };
 
 use crate::{input::InputCmd, sink::Frame};
+use crate::layout::{Layout, Rect};
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -129,6 +130,11 @@ pub struct State {
     /// location, so we keep track of it across button/scroll events.
     pub pointer_pos:       (f64, f64),
     pub toplevels:         Vec<ToplevelSurface>,
+    /// Dwindle tiling state (focus + split orientation).
+    pub layout:            Layout,
+    /// Per-window rects, indexed to match the live-toplevel order. Recomputed
+    /// by `relayout` whenever the window set or output size changes.
+    pub layout_rects:      Vec<Rect>,
     pub popups:            PopupManager,
     pub surface_buffers:   HashMap<ObjectId, SurfaceBuf>,
     pub cursor_status:     CursorImageStatus,
@@ -259,23 +265,18 @@ impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState { &mut self.xdg_shell_state }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // Tell the client our viewport size but DON'T force Fullscreen —
-        // weston-terminal, thunar and friends gate input/decoration on
-        // !Fullscreen. We still composite at (0,0); the client can pick
-        // whatever size it wants up to this bound.
-        let size = (self.output_w as i32, self.output_h as i32);
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Activated);
-            state.size = Some(size.into());
-        });
-        surface.send_configure();
-
+        // We DON'T force Fullscreen — weston-terminal, thunar and friends gate
+        // input/decoration on !Fullscreen. The tiled size is sent by relayout.
         let wl = surface.wl_surface().clone();
         let serial = self.next_serial();
         let kb = self.keyboard.clone();
         kb.set_focus(self, Some(wl), serial);
 
         self.toplevels.push(surface);
+        // New window takes focus; retile so every window gets its rect + size.
+        let n = self.toplevels.iter().filter(|t| t.alive()).count();
+        self.layout.focused = n.saturating_sub(1);
+        relayout(self);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -664,6 +665,46 @@ fn blit_subtree(
     );
 }
 
+/// Recompute the dwindle tiling and push each toplevel its new size. Call
+/// whenever the live window set or the output size changes. Also marks the
+/// focused window Activated (others deactivated) so clients render focus state.
+fn relayout(state: &mut State) {
+    let n = state.toplevels.iter().filter(|t| t.alive()).count();
+    if state.layout.focused >= n {
+        state.layout.focused = n.saturating_sub(1);
+    }
+    let focused = state.layout.focused;
+    let rects = state.layout.rects(n, state.output_w, state.output_h);
+
+    for (i, tl) in state.toplevels.iter().filter(|t| t.alive()).enumerate() {
+        let r = rects[i];
+        tl.with_pending_state(|s| {
+            s.size = Some((r.w as i32, r.h as i32).into());
+            if i == focused {
+                s.states.set(xdg_toplevel::State::Activated);
+            } else {
+                s.states.unset(xdg_toplevel::State::Activated);
+            }
+        });
+        tl.send_configure();
+    }
+
+    state.layout_rects = rects;
+    state.dirty = true;
+}
+
+/// Point the keyboard at whichever live toplevel is currently focused (or
+/// nothing, if there are no windows left).
+fn refocus_keyboard(state: &mut State) {
+    let target = state.toplevels.iter()
+        .filter(|t| t.alive())
+        .nth(state.layout.focused)
+        .map(|t| t.wl_surface().clone());
+    let serial = state.next_serial();
+    let kb = state.keyboard.clone();
+    kb.set_focus(state, target, serial);
+}
+
 /// Composite all live toplevels + their popups + the cursor into a single
 /// RGBA frame and ship it. Called from the periodic tick when `dirty`.
 fn composite_and_send(state: &mut State, composite_interval: Duration) {
@@ -680,16 +721,19 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
     let h = state.output_h;
     let mut back = vec![0u8; (w as usize) * (h as usize) * 4];
 
-    // Toplevels (root buffer + subsurfaces) then their popups.
+    // Toplevels (root buffer + subsurfaces) then their popups, each at its
+    // tiled rect origin. Popups are positioned relative to their toplevel.
     let toplevels: Vec<WlSurface> = state.toplevels.iter()
         .filter(|t| t.alive())
         .map(|t| t.wl_surface().clone())
         .collect();
-    for surf in &toplevels {
-        blit_subtree(&mut back, w, h, &state.surface_buffers, surf, (0, 0));
+    for (i, surf) in toplevels.iter().enumerate() {
+        let r = state.layout_rects.get(i).copied()
+            .unwrap_or(Rect { x: 0, y: 0, w, h });
+        blit_subtree(&mut back, w, h, &state.surface_buffers, surf, (r.x, r.y));
         for (popup, off) in PopupManager::popups_for_surface(surf) {
             let ps = popup.wl_surface().clone();
-            blit_subtree(&mut back, w, h, &state.surface_buffers, &ps, (off.x, off.y));
+            blit_subtree(&mut back, w, h, &state.surface_buffers, &ps, (r.x + off.x, r.y + off.y));
         }
     }
 
@@ -762,17 +806,23 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
     let xi = x as i32;
     let yi = y as i32;
 
-    for top in state.toplevels.iter().rev() {
-        if !top.alive() { continue; }
-        let root = top.wl_surface().clone();
+    // Live toplevels paired with their tiled rect, topmost (last) first.
+    let live: Vec<WlSurface> = state.toplevels.iter()
+        .filter(|t| t.alive())
+        .map(|t| t.wl_surface().clone())
+        .collect();
+    for (i, root) in live.iter().enumerate().rev() {
+        let r = state.layout_rects.get(i).copied()
+            .unwrap_or(Rect { x: 0, y: 0, w: state.output_w, h: state.output_h });
 
-        // Popups (per-toplevel) — last-added wins on overlap.
-        let popups: Vec<_> = PopupManager::popups_for_surface(&root).collect();
+        // Popups (per-toplevel) — last-added wins on overlap. Positioned at
+        // the toplevel rect origin + the popup's toplevel-relative offset.
+        let popups: Vec<_> = PopupManager::popups_for_surface(root).collect();
         for (popup, off) in popups.iter().rev() {
             let ps = popup.wl_surface();
             if let Some(buf) = state.surface_buffers.get(&ps.id()) {
-                let bx = off.x;
-                let by = off.y;
+                let bx = r.x + off.x;
+                let by = r.y + off.y;
                 if xi >= bx && yi >= by
                     && xi < bx + buf.w as i32 && yi < by + buf.h as i32
                 {
@@ -783,12 +833,12 @@ fn pick_focus(state: &State, x: f64, y: f64) -> Option<(WlSurface, smithay::util
             }
         }
 
-        // Toplevel root is at (0,0) in compositor space.
+        // Toplevel root sits at its rect origin.
         if let Some(buf) = state.surface_buffers.get(&root.id()) {
-            if xi >= 0 && yi >= 0
-                && xi < buf.w as i32 && yi < buf.h as i32
+            if xi >= r.x && yi >= r.y
+                && xi < r.x + buf.w as i32 && yi < r.y + buf.h as i32
             {
-                return Some((root, (0.0_f64, 0.0_f64).into()));
+                return Some((root.clone(), (r.x as f64, r.y as f64).into()));
             }
         }
     }
@@ -859,14 +909,8 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                 refresh: 60_000,
             };
             state.output.change_current_state(Some(mode), None, None, None);
-            for tl in &state.toplevels {
-                if !tl.alive() { continue; }
-                tl.with_pending_state(|s| {
-                    s.size = Some((width as i32, height as i32).into());
-                });
-                tl.send_configure();
-            }
-            state.dirty = true;
+            // Retile everyone into the new output extent.
+            relayout(state);
         }
 
         InputCmd::Scroll { v120 } => {
@@ -990,6 +1034,8 @@ pub fn run(
         output_w: width, output_h: height,
         pointer_pos: (0.0, 0.0),
         toplevels: Vec::new(),
+        layout: Layout::default(),
+        layout_rects: Vec::new(),
         popups:           PopupManager::default(),
         surface_buffers:  HashMap::new(),
         cursor_status:    CursorImageStatus::default_named(),
@@ -1072,8 +1118,14 @@ pub fn run(
     let stop_t = stop.clone();
     let tick = Timer::immediate();
     handle.insert_source(tick, move |_, _, data| {
-        // Prune toplevels that the client has destroyed.
+        // Prune toplevels that the client has destroyed. If any closed, retile
+        // the survivors and move keyboard focus onto one of them.
+        let before = data.state.toplevels.len();
         data.state.toplevels.retain(|t| t.alive());
+        if data.state.toplevels.len() != before {
+            relayout(&mut data.state);
+            refocus_keyboard(&mut data.state);
+        }
 
         // Drain input cmds.
         while let Ok(cmd) = input_rx.try_recv() {
