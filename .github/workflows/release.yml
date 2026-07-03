@@ -75,6 +75,7 @@ jobs:
           VERSION: ${{ github.event.inputs.version }}
         run: |
           set -e
+          DEB_VERSION="${VERSION#v}"
           cd release
           for f in veil-host-*; do
             if [ -f "$f" ]; then
@@ -89,7 +90,7 @@ jobs:
               chmod 755 "${pkgdir}/usr/local/bin/veil-host"
               printf "%s\n" \
                 "Package: veil-host" \
-                "Version: ${VERSION}" \
+                "Version: ${DEB_VERSION}" \
                 "Section: utils" \
                 "Priority: optional" \
                 "Architecture: ${deb_arch}" \
