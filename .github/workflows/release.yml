@@ -1,5 +1,4 @@
 name: Release
-
 on:
   workflow_dispatch:
     inputs:
@@ -9,65 +8,47 @@ on:
       title:
         description: "Release title"
         required: true
-
 permissions:
   contents: write
-
 jobs:
   build-x86_64:
     name: Build x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
-
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev pkg-config build-essential
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
       - name: Build
         run: cargo build --release
-
       - name: Rename binary
         run: cp target/release/veil-host veil-host-x86_64-unknown-linux-gnu
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: veil-host-x86_64-unknown-linux-gnu
           path: veil-host-x86_64-unknown-linux-gnu
-
   build-aarch64:
     name: Build aarch64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev pkg-config build-essential
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
       - name: Build
-        run: cross build --release --target aarch64-unknown-linux-gnu
-
+        run: cargo build --release
       - name: Rename binary
-        run: cp target/aarch64-unknown-linux-gnu/release/veil-host veil-host-aarch64-unknown-linux-gnu
-
+        run: cp target/release/veil-host veil-host-aarch64-unknown-linux-gnu
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: veil-host-aarch64-unknown-linux-gnu
           path: veil-host-aarch64-unknown-linux-gnu
-
-  release:
-    name: Create Release
+  package:
+    name: Package artifacts
     needs: [build-x86_64, build-aarch64]
     runs-on: ubuntu-latest
     steps:
@@ -75,12 +56,75 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-
+      - name: Prepare release dir
+        run: |
+          mkdir -p release
+          for f in veil-host-*; do
+            if [ -f "$f" ]; then
+              mv "$f" release/
+            fi
+          done
+      - name: Create tar.gz (raw binaries)
+        run: |
+          cd release
+          for f in *; do
+            tar -czf "${f}.tar.gz" "$f"
+          done
+      - name: Create .deb packages (simple dpkg-deb)
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -e
+          cd release
+          for f in veil-host-*; do
+            if [ -f "$f" ]; then
+              case "$f" in
+                *x86_64*) arch=amd64; deb_arch=amd64;;
+                *aarch64*) arch=arm64; deb_arch=arm64;;
+                *) arch=all; deb_arch=all;;
+              esac
+              pkgdir="pkg_${arch}"
+              mkdir -p "${pkgdir}/DEBIAN" "${pkgdir}/usr/local/bin"
+              cp "$f" "${pkgdir}/usr/local/bin/veil-host"
+              chmod 755 "${pkgdir}/usr/local/bin/veil-host"
+              printf "%s\n" \
+                "Package: veil-host" \
+                "Version: ${VERSION}" \
+                "Section: utils" \
+                "Priority: optional" \
+                "Architecture: ${deb_arch}" \
+                "Maintainer: ${GITHUB_ACTOR} <>" \
+                "Description: veil-host binary" \
+                "Depends: libseat-dev" \
+                > "${pkgdir}/DEBIAN/control"
+              dpkg-deb --build "${pkgdir}" "veil-host_${VERSION}_${deb_arch}.deb"
+            fi
+          done
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            release/veil-host-x86_64-unknown-linux-gnu
+            release/veil-host-aarch64-unknown-linux-gnu
+            release/*.tar.gz
+            release/*.deb
+  release:
+    name: Create Release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.version }}
           name: ${{ github.event.inputs.title }}
           files: |
-            veil-host-x86_64-unknown-linux-gnu
-            veil-host-aarch64-unknown-linux-gnu
+            release/veil-host-x86_64-unknown-linux-gnu
+            release/veil-host-aarch64-unknown-linux-gnu
+            release/*.tar.gz
+            release/*.deb
