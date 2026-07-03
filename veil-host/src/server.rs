@@ -95,6 +95,7 @@ use smithay::backend::allocator::{
 
 use crate::{input::InputCmd, sink::Frame};
 use crate::layout::{Layout, Rect};
+use crate::detile::GpuImporter;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -107,6 +108,9 @@ pub struct State {
     pub output_manager:    OutputManagerState,
     pub dmabuf_state:      DmabufState,
     pub _dmabuf_global:    DmabufGlobal,
+    /// GPU dmabuf importer for tiled/non-linear client buffers. `None` when no
+    /// render node / EGL is available — veil then stays CPU-only + linear-only.
+    pub gpu:               Option<GpuImporter>,
     pub _data_device:      DataDeviceState,
     pub _xdg_decoration:        XdgDecorationState,
     pub _viewporter:            ViewporterState,
@@ -212,7 +216,7 @@ impl CompositorHandler for State {
 
         match assign {
             Assign::New(buffer) => {
-                // Try shm first, then dmabuf (linear mmap path).
+                // Try shm first, then dmabuf.
                 let imported = with_buffer_contents(&buffer, |ptr, len, data| {
                     tracing::info!("commit {} shm {}x{} fmt={:?}", surface.id(), data.width, data.height, data.format);
                     let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
@@ -222,8 +226,19 @@ impl CompositorHandler for State {
                 .flatten()
                 .or_else(|| {
                     let dmabuf = get_dmabuf(&buffer).ok()?;
-                    tracing::info!("commit {} dma {}x{} fmt={:?}", surface.id(), dmabuf.width(), dmabuf.height(), dmabuf.format().code);
-                    import_dmabuf(dmabuf)
+                    tracing::info!("commit {} dma {}x{} fmt={:?} mod={:?}",
+                        surface.id(), dmabuf.width(), dmabuf.height(),
+                        dmabuf.format().code, dmabuf.format().modifier);
+                    // Linear → CPU mmap (fast, no GPU roundtrip). Anything else
+                    // (tiled / implicit modifier) → GPU detile via EGLImage, if
+                    // an importer is up; otherwise unsupported → blank.
+                    if dmabuf.format().modifier == Modifier::Linear {
+                        import_dmabuf(dmabuf)
+                    } else if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.import(dmabuf)
+                    } else {
+                        None
+                    }
                 });
 
                 if let Some((rgba, w, h)) = imported {
@@ -377,26 +392,36 @@ impl DmabufHandler for State {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // Accept single-plane linear dmabufs in supported formats.
-        // Actual pixel import happens in commit() via map_plane + mmap.
-        if dmabuf.num_planes() != 1 {
-            notifier.failed();
-            return;
-        }
         let fmt = dmabuf.format();
-        // Only linear (or unspecified) modifier — tiled/compressed layouts
-        // can't be mmapped directly without a GPU decompression pass.
-        if fmt.modifier != Modifier::Linear && fmt.modifier != Modifier::Invalid {
-            notifier.failed();
+
+        // Fast path: single-plane LINEAR in a format our CPU mmap converter
+        // handles (see import_dmabuf) — no GPU needed.
+        let cpu_ok = dmabuf.num_planes() == 1
+            && fmt.modifier == Modifier::Linear
+            && matches!(
+                fmt.code,
+                Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888
+            );
+
+        if cpu_ok {
+            let _ = notifier.successful::<State>();
             return;
         }
-        match fmt.code {
-            Fourcc::Argb8888 | Fourcc::Xrgb8888 |
-            Fourcc::Abgr8888 | Fourcc::Xbgr8888 => {
+
+        // GPU path: any tiled / non-linear buffer, imported as an EGLImage and
+        // read back linear (see detile::GpuImporter). Actually trial-import it
+        // now so we only accept what we can genuinely detile.
+        if let Some(gpu) = self.gpu.as_mut() {
+            if gpu.can_import(&dmabuf) {
                 let _ = notifier.successful::<State>();
+                return;
             }
-            _ => notifier.failed(),
         }
+
+        // No GPU, or the buffer won't import → reject. The client falls back to
+        // shm (software) rendering, which we always handle, instead of handing
+        // us a buffer we'd render blank or freeze trying to CPU-map.
+        notifier.failed();
     }
 }
 
@@ -467,17 +492,18 @@ delegate_presentation!(State);
 
 /// Build the default dmabuf feedback advertised to clients via linux-dmabuf-v4.
 ///
-/// We claim the first accessible DRM render node as the main device and
-/// advertise only single-plane linear formats — the formats our map_plane
-/// mmap path can actually import. Chromium reads this feedback and allocates
-/// DRM_FORMAT_MOD_LINEAR buffers, which we can then mmap without any GPU
-/// decompression pass.
-fn build_dmabuf_feedback() -> DmabufFeedback {
+/// We claim the first accessible DRM render node as the main device. The linear
+/// single-plane formats are always advertised — our map_plane mmap path imports
+/// those with no GPU. When a [`GpuImporter`] is up we additionally advertise the
+/// render node's full format+modifier set, so GPU compositors (niri, Hyprland)
+/// and GL/Vulkan apps allocate their native *tiled* buffers, which we detile via
+/// EGLImage. Chromium (feedback-aware) still picks linear and takes the CPU path.
+fn build_dmabuf_feedback(gpu: &Option<GpuImporter>) -> DmabufFeedback {
     use std::os::unix::fs::MetadataExt;
     use smithay::backend::allocator::Format;
 
-    // Walk render nodes to find the first accessible one. dev_t tells
-    // Chromium which GPU device to allocate on (must match the node it opens).
+    // Walk render nodes to find the first accessible one. dev_t tells clients
+    // which GPU device to allocate on (must match the node it opens).
     let dev_t: libc::dev_t = (128..=135u32)
         .map(|n| format!("/dev/dri/renderD{n}"))
         .find_map(|path| std::fs::metadata(&path).ok().map(|m| m.rdev()))
@@ -489,12 +515,25 @@ fn build_dmabuf_feedback() -> DmabufFeedback {
         eprintln!("[veil-host] dmabuf feedback: dev_t={dev_t:#x} (renderD{})", (dev_t & 0xFF));
     }
 
-    let formats = [
+    // Always-importable linear formats (CPU mmap path).
+    let mut formats: Vec<Format> = vec![
         Format { code: Fourcc::Argb8888, modifier: Modifier::Linear },
         Format { code: Fourcc::Xrgb8888, modifier: Modifier::Linear },
         Format { code: Fourcc::Abgr8888, modifier: Modifier::Linear },
         Format { code: Fourcc::Xbgr8888, modifier: Modifier::Linear },
     ];
+
+    // Everything the render node can import (tiled modifiers included).
+    if let Some(g) = gpu {
+        for f in g.formats() {
+            if !formats.contains(&f) {
+                formats.push(f);
+            }
+        }
+        eprintln!("[veil-host] dmabuf feedback: {} formats (GPU detile enabled)", formats.len());
+    } else {
+        eprintln!("[veil-host] dmabuf feedback: linear-only (no GPU importer)");
+    }
 
     DmabufFeedbackBuilder::new(dev_t, formats)
         .build()
@@ -506,6 +545,11 @@ fn build_dmabuf_feedback() -> DmabufFeedback {
 fn import_dmabuf(dmabuf: &Dmabuf) -> Option<(Vec<u8>, u32, u32)> {
     if dmabuf.num_planes() != 1 { return None; }
     let fmt    = dmabuf.format();
+    // Backstop: this is the CPU fast path — only ever mmap a LINEAR buffer.
+    // Tiled / non-linear buffers go through the GPU detile path (commit routes
+    // them to GpuImporter); a stray one reaching map_plane here would freeze the
+    // compositor thread on an uncached/detiled CPU read, so bail.
+    if fmt.modifier != Modifier::Linear { return None; }
     let w      = dmabuf.width()  as usize;
     let h      = dmabuf.height() as usize;
     let stride = dmabuf.strides().next()? as usize;
@@ -957,12 +1001,16 @@ pub fn run(
     let xdg_shell_state  = XdgShellState::new::<State>(&dh);
     let xdg_activation   = XdgActivationState::new::<State>(&dh);
     let output_manager   = OutputManagerState::new_with_xdg_output::<State>(&dh);
-    // v4 dmabuf with default feedback: tell Chromium which DRM device to
-    // allocate on and that we only accept linear buffers. Chromium reads
-    // the feedback tranche and allocates DRM_FORMAT_MOD_LINEAR, which our
-    // map_plane mmap path can import directly without GPU decompression.
+    // Bring up the GPU dmabuf importer (EGL/GLES on the render node). None if
+    // there's no GPU / EGL — veil then stays CPU-only + linear-only. Created
+    // before the dmabuf global so feedback can advertise its formats.
+    let gpu = GpuImporter::new();
+
+    // v4 dmabuf with default feedback: advertise the render device + the formats
+    // we can import (linear always; tiled too when the GPU importer is up).
+    // Feedback-aware clients allocate accordingly; we detile tiled buffers.
     let mut dmabuf_state  = DmabufState::new();
-    let dmabuf_feedback   = build_dmabuf_feedback();
+    let dmabuf_feedback   = build_dmabuf_feedback(&gpu);
     let _dmabuf_global    = dmabuf_state.create_global_with_default_feedback::<State>(&dh, &dmabuf_feedback);
     let _data_device          = DataDeviceState::new::<State>(&dh);
     let _xdg_decoration       = XdgDecorationState::new::<State>(&dh);
@@ -1025,6 +1073,7 @@ pub fn run(
         compositor_state, xdg_shell_state, shm_state, seat_state,
         xdg_activation, output_manager,
         dmabuf_state, _dmabuf_global,
+        gpu,
         _data_device,
         _xdg_decoration, _viewporter, _fractional, _presentation,
         _text_input, _primary_sel, _cursor_shape,

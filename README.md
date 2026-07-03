@@ -169,6 +169,29 @@ Full bidirectional bridge:
 
 ---
 
+## Running browsers (and other keyring apps) under veil
+
+> [!NOTE]
+> **A browser opened under veil can look like its profile was wiped — logged out
+> everywhere, saved passwords gone. Your data is safe.** It's the same profile
+> directory on the same disk; nothing is deleted or moved.
+>
+> Chromium/Firefox encrypt cookies and passwords with a key held in your
+> **keyring** (`gnome-keyring` / `org.freedesktop.secrets`), which your display
+> manager unlocks via PAM at login. A session started *outside* that login path —
+> e.g. a bare compositor (`niri`, `Hyprland`) hosted under veil — never gets that
+> key handed to it, so the browser can't decrypt your existing logins and shows a
+> fresh-looking session. Bookmarks and history (unencrypted) are still there.
+>
+> **It returns to normal in your real login session** — the key is available
+> again and the untouched files decrypt as usual. To avoid churn, close the
+> browser before leaving veil and don't bother re-signing-in inside it.
+>
+> If you use **profile-sync-daemon (psd)**, be extra careful: psd mirrors a
+> profile to tmpfs and syncs it back on exit, so a "reset"-looking session could
+> be written over your good backup. Close psd-managed browsers before running
+> them under a nested session.
+
 ## Limitations
 
 - **dmabuf / GPU import** — Chromium, Electron, Firefox require `zwp_linux_dmabuf_v1` with real GBM/EGL import. Planned for v1.5. For now, set `LIBGL_ALWAYS_SOFTWARE=1` (done automatically) to push them to shm.

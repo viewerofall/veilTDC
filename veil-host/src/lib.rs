@@ -10,6 +10,7 @@
 use std::sync::mpsc;
 use std::thread;
 
+pub mod detile;
 pub mod input;
 pub mod input_backend;
 pub mod layout;

@@ -17,7 +17,7 @@ rustix                = { version = "1", features = ["mm", "fs"] }
 evdev                 = "0.13"
 libc                  = "0.2"
 flate2                = "1.1"
-smithay               = { version = "0.7", default-features = false, features = ["wayland_frontend", "xwayland", "desktop"] }
+smithay               = { version = "0.7", default-features = false, features = ["wayland_frontend", "xwayland", "desktop", "backend_egl", "backend_gbm", "backend_drm", "renderer_gl"] }
 calloop               = "0.14"
 tracing               = "0.1"
 drm                   = "0.15"

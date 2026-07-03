@@ -7,7 +7,6 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
-use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -32,7 +31,6 @@ impl InputBackend for CrosstermInput {
 
         let mut tick = 0u32;
         let mut btns = [false; 3];
-        let mut held_keys = HashSet::<u32>::new();
         let mut cur_cols = geom.cols.load(Ordering::Relaxed);
         let mut cur_rows = geom.rows.load(Ordering::Relaxed);
         let mut last_event_time = std::time::Instant::now();
@@ -63,7 +61,7 @@ impl InputBackend for CrosstermInput {
                             host_stop.store(true, Ordering::Relaxed);
                             break;
                         }
-                        Event::Key(k) => forward_key(&tx, k, &mut held_keys),
+                        Event::Key(k) => forward_key(&tx, k),
                         Event::Mouse(m) => {
                             let cw = geom.comp_w.load(Ordering::Relaxed);
                             let ch = geom.comp_h.load(Ordering::Relaxed);
@@ -159,11 +157,21 @@ fn is_kill_key(k: &KeyEvent) -> bool {
     matches!(k.code, KeyCode::Home) && k.kind != KeyEventKind::Release
 }
 
-/// Map crossterm KeyEvent → evdev keycode, forward with proper hold/release.
+/// Map a crossterm KeyEvent → evdev keycodes and forward it as a discrete
+/// press+release "tap".
 ///
-/// Wayland clients drive repeat themselves via wl_keyboard.repeat_info, so we
-/// send Press once then Release; duplicate Press events are ignored.
-fn forward_key(tx: &Sender<InputCmd>, k: KeyEvent, held: &mut HashSet<u32>) {
+/// Why not track hold/release: terminals don't reliably report key *release*
+/// (only the kitty keyboard protocol does, and not every terminal supports it).
+/// Depending on release meant a tapped key stuck "held" in the client, which
+/// then repeated forever via wl_keyboard.repeat_info — the runaway-repeat bug.
+/// Emitting each keystroke as its own press+release means nothing is ever left
+/// held: holding a key still repeats, but driven by the terminal's own
+/// auto-repeat (it resends Press/Repeat events), never by a stuck key. Explicit
+/// Release events, when a terminal does send them, are redundant → ignored.
+fn forward_key(tx: &Sender<InputCmd>, k: KeyEvent) {
+    if k.kind == KeyEventKind::Release {
+        return;
+    }
     let keycode = match keycode_for(k.code) {
         Some(c) => c,
         None => return,
@@ -172,28 +180,15 @@ fn forward_key(tx: &Sender<InputCmd>, k: KeyEvent, held: &mut HashSet<u32>) {
     let ctrl  = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt   = k.modifiers.contains(KeyModifiers::ALT);
 
-    match k.kind {
-        KeyEventKind::Repeat => {
-            // Held key — Wayland client drives repeat; nothing to resend.
-        }
-        KeyEventKind::Release => {
-            if held.remove(&keycode) {
-                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: false });
-                if alt   { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: false }); }
-                if ctrl  { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: false }); }
-                if shift { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: false }); }
-            }
-        }
-        _ => {
-            if !held.contains(&keycode) {
-                held.insert(keycode);
-                if shift { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: true }); }
-                if ctrl  { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: true }); }
-                if alt   { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: true }); }
-                let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: true });
-            }
-        }
-    }
+    // Modifiers down, key down, key up, modifiers up — a self-contained chord.
+    if shift { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: true }); }
+    if ctrl  { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: true }); }
+    if alt   { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: true }); }
+    let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: true });
+    let _ = tx.send(InputCmd::Key { keycode, mods: 0, pressed: false });
+    if alt   { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTALT,   mods: 0, pressed: false }); }
+    if ctrl  { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTCTRL,  mods: 0, pressed: false }); }
+    if shift { let _ = tx.send(InputCmd::Key { keycode: KEY_LEFTSHIFT, mods: 0, pressed: false }); }
 }
 
 fn needs_shift(code: KeyCode) -> bool {
