@@ -254,6 +254,16 @@ impl OutputBackend for DrmOutput {
         // Service VT enable/disable. While suspended (another VT foreground)
         // we must not touch the card.
         let _ = self.seat.dispatch();
+
+        // A Ctrl+Alt+Fn chord caught by the (grabbed) evdev thread — relay it
+        // to libseat. Checked before the is_active early-return: this is how
+        // we switch AWAY, so it must fire even mid-transition.
+        if let Some(vt) = crate::seat::take_pending_vt() {
+            if let Err(e) = self.seat.switch_session(vt) {
+                eprintln!("[veil-host] VT switch to {vt} failed: {e}");
+            }
+        }
+
         if !self.seat.is_active() {
             return Ok(());
         }

@@ -11,9 +11,12 @@ use std::sync::mpsc;
 use std::thread;
 
 pub mod detile;
+pub mod font5x7;
 pub mod input;
 pub mod input_backend;
+pub mod launcher;
 pub mod layout;
+pub mod lockfile;
 pub mod server;
 pub mod sink;
 pub mod output;
@@ -32,6 +35,8 @@ pub struct HostConfig {
     pub fps:           u32,
     pub spawn:         Option<Vec<String>>,
     pub wayland_debug: bool,
+    pub keybinds:      veil_config::Keybinds,
+    pub background:    [u8; 3],
 }
 
 /// Signal handle returned by [`Host::spawn`]; flip via [`Host::stop`]
@@ -48,6 +53,8 @@ impl Default for HostConfig {
             fps:           60,
             spawn:         None,
             wayland_debug: false,
+            keybinds:      veil_config::Keybinds::default(),
+            background:    [0x8c, 0x8c, 0x8c],
         }
     }
 }
@@ -79,6 +86,8 @@ impl Host {
                     frame_tx,
                     input_rx,
                     stop_t,
+                    config.keybinds,
+                    config.background,
                 ) {
                     eprintln!("[veil-host] server exited: {e}");
                 }

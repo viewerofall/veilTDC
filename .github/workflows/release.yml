@@ -52,6 +52,7 @@ jobs:
     needs: [build-x86_64, build-aarch64]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -64,10 +65,11 @@ jobs:
               mv "$f" release/
             fi
           done
+          cp config.lua release/config.lua
       - name: Create tar.gz (raw binaries)
         run: |
           cd release
-          for f in *; do
+          for f in veil-host-*; do
             tar -czf "${f}.tar.gz" "$f"
           done
       - name: Create .deb packages (simple dpkg-deb)
@@ -85,9 +87,10 @@ jobs:
                 *) arch=all; deb_arch=all;;
               esac
               pkgdir="pkg_${arch}"
-              mkdir -p "${pkgdir}/DEBIAN" "${pkgdir}/usr/local/bin"
+              mkdir -p "${pkgdir}/DEBIAN" "${pkgdir}/usr/local/bin" "${pkgdir}/usr/share/veil-host"
               cp "$f" "${pkgdir}/usr/local/bin/veil-host"
               chmod 755 "${pkgdir}/usr/local/bin/veil-host"
+              cp config.lua "${pkgdir}/usr/share/veil-host/config.lua"
               printf "%s\n" \
                 "Package: veil-host" \
                 "Version: ${DEB_VERSION}" \
@@ -108,6 +111,7 @@ jobs:
           path: |
             release/veil-host-x86_64-unknown-linux-gnu
             release/veil-host-aarch64-unknown-linux-gnu
+            release/config.lua
             release/*.tar.gz
             release/*.deb
   release:
@@ -128,5 +132,6 @@ jobs:
           files: |
             release/veil-host-x86_64-unknown-linux-gnu
             release/veil-host-aarch64-unknown-linux-gnu
+            release/config.lua
             release/*.tar.gz
             release/*.deb

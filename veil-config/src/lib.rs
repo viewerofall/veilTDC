@@ -65,6 +65,157 @@ pub fn detect_quality() -> Quality {
     Quality::AsciiLuma
 }
 
+/// Output backend preference (`output` in Lua). `Auto` keeps the existing
+/// env-based heuristic (WAYLAND_DISPLAY/DISPLAY/SSH_* → terminal, else try
+/// DRM/KMS). `Drm` skips the heuristic entirely and always goes straight for
+/// DRM/KMS on `run` — for a bare-TTY daily driver with real GPU hardware,
+/// where the heuristic's SSH/env checks can misfire (e.g. a stale
+/// WAYLAND_DISPLAY left in the shell from a prior graphical session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputPref {
+    Auto,
+    Drm,
+    Terminal,
+}
+
+impl OutputPref {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "drm" | "kms" => Self::Drm,
+            "terminal" | "term" => Self::Terminal,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// The modifier held down with a tiling keybind (`keybinds.mod_key` in Lua).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModKey {
+    Super,
+    Ctrl,
+    Alt,
+    Shift,
+}
+
+impl ModKey {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "ctrl"  => Self::Ctrl,
+            "alt"   => Self::Alt,
+            "shift" => Self::Shift,
+            _       => Self::Super,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Super => "Super",
+            Self::Ctrl  => "Ctrl",
+            Self::Alt   => "Alt",
+            Self::Shift => "Shift",
+        }
+    }
+}
+
+/// A tiling-layout operation a keybind can trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    Swap,
+    Rotate,
+    Close,
+    ResizeGrow,
+    ResizeShrink,
+}
+
+impl Action {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FocusLeft    => "focus left",
+            Self::FocusRight   => "focus right",
+            Self::FocusUp      => "focus up",
+            Self::FocusDown    => "focus down",
+            Self::Swap         => "swap with next",
+            Self::Rotate       => "rotate split",
+            Self::Close        => "close window",
+            Self::ResizeGrow   => "resize grow",
+            Self::ResizeShrink => "resize shrink",
+        }
+    }
+}
+
+/// Parsed `keybinds` table. `binds` preserves declaration order — the Super+/
+/// help overlay lists them verbatim, so config order is display order.
+#[derive(Debug, Clone)]
+pub struct Keybinds {
+    pub mod_key: ModKey,
+    pub binds:   Vec<(char, Action)>,
+}
+
+impl Keybinds {
+    pub fn action_for(&self, key: char) -> Option<Action> {
+        self.binds.iter().find(|(k, _)| *k == key).map(|(_, a)| *a)
+    }
+}
+
+impl Default for Keybinds {
+    fn default() -> Self {
+        Self {
+            mod_key: ModKey::Super,
+            binds: vec![
+                ('h', Action::FocusLeft),
+                ('l', Action::FocusRight),
+                ('k', Action::FocusUp),
+                ('j', Action::FocusDown),
+                ('s', Action::Swap),
+                ('r', Action::Rotate),
+                ('q', Action::Close),
+                ('=', Action::ResizeGrow),
+                ('-', Action::ResizeShrink),
+            ],
+        }
+    }
+}
+
+fn parse_keybinds(gl: &mlua::Table) -> Keybinds {
+    let default = Keybinds::default();
+    let Ok(t) = gl.get::<mlua::Table>("keybinds") else {
+        return default;
+    };
+
+    let mod_key = t.get::<String>("mod_key")
+        .map(|s| ModKey::from_str(&s))
+        .unwrap_or(default.mod_key);
+
+    // (Lua field name, Action) — order here is the help-menu display order.
+    const FIELDS: [(&str, Action); 9] = [
+        ("focus_left",    Action::FocusLeft),
+        ("focus_right",   Action::FocusRight),
+        ("focus_up",      Action::FocusUp),
+        ("focus_down",    Action::FocusDown),
+        ("swap",          Action::Swap),
+        ("rotate",        Action::Rotate),
+        ("close",         Action::Close),
+        ("resize_grow",   Action::ResizeGrow),
+        ("resize_shrink", Action::ResizeShrink),
+    ];
+
+    let binds = FIELDS.iter().map(|(field, action)| {
+        let key = t.get::<String>(*field).ok()
+            .and_then(|s| s.chars().next())
+            .map(|c| c.to_ascii_lowercase())
+            .unwrap_or_else(|| {
+                default.binds.iter().find(|(_, a)| a == action).unwrap().0
+            });
+        (key, *action)
+    }).collect();
+
+    Keybinds { mod_key, binds }
+}
+
 #[derive(Debug, Clone)]
 pub struct VeilConfig {
     pub quality:           Quality,
@@ -74,6 +225,13 @@ pub struct VeilConfig {
     /// Whether to use GPU compute shaders for frame encoding (halfblock/luma).
     /// Defaults to true. Set `gpu_render = false` in config.lua to disable.
     pub gpu_render:        bool,
+    pub keybinds:          Keybinds,
+    pub output:            OutputPref,
+    /// Bare background color (RGB), shown wherever no window covers —
+    /// otherwise it's plain black, an actual void with zero windows open
+    /// (which now happens on purpose, since Alt+D lets you get there).
+    /// `background = "#RRGGBB"` in Lua. Defaults to a cement grey.
+    pub background:        [u8; 3],
 }
 
 impl Default for VeilConfig {
@@ -84,8 +242,24 @@ impl Default for VeilConfig {
             cage_timeout_secs: 8,
             input:             true,
             gpu_render:        true,
+            keybinds:          Keybinds::default(),
+            output:            OutputPref::Auto,
+            background:        [0x8c, 0x8c, 0x8c],
         }
     }
+}
+
+/// Parse `"#RRGGBB"` or `"RRGGBB"` into RGB bytes. `None` on anything else —
+/// callers fall back to the default rather than erroring the whole config.
+pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r, g, b])
 }
 
 impl VeilConfig {
@@ -131,5 +305,35 @@ pub fn load(path: &Path) -> VeilConfig {
             .unwrap_or(d.input),
         gpu_render: gl.get::<bool>("gpu_render")
             .unwrap_or(d.gpu_render),
+        keybinds: parse_keybinds(&gl),
+        output: gl.get::<String>("output")
+            .map(|s| OutputPref::from_str(&s))
+            .unwrap_or(d.output),
+        background: gl.get::<String>("background")
+            .ok()
+            .and_then(|s| parse_hex_color(&s))
+            .unwrap_or(d.background),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_color_with_hash() {
+        assert_eq!(parse_hex_color("#4b5d45"), Some([0x4b, 0x5d, 0x45]));
+    }
+
+    #[test]
+    fn hex_color_without_hash() {
+        assert_eq!(parse_hex_color("4B5D45"), Some([0x4b, 0x5d, 0x45]));
+    }
+
+    #[test]
+    fn hex_color_rejects_garbage() {
+        assert_eq!(parse_hex_color("not a color"), None);
+        assert_eq!(parse_hex_color("#fff"), None); // no 3-digit shorthand
+        assert_eq!(parse_hex_color(""), None);
     }
 }

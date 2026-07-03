@@ -28,7 +28,7 @@ use smithay::{
     delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
-        keyboard::{FilterResult, KeyboardHandle, KeysymHandle, ModifiersState, XkbConfig},
+        keyboard::{keysyms, FilterResult, KeyboardHandle, KeysymHandle, ModifiersState, XkbConfig},
         pointer::{
             AxisFrame, ButtonEvent, CursorImageAttributes, CursorImageStatus, MotionEvent,
             PointerHandle,
@@ -96,6 +96,7 @@ use smithay::backend::allocator::{
 use crate::{input::InputCmd, sink::Frame};
 use crate::layout::{Layout, Rect};
 use crate::detile::GpuImporter;
+use crate::launcher::Launcher;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -139,6 +140,20 @@ pub struct State {
     /// Per-window rects, indexed to match the live-toplevel order. Recomputed
     /// by `relayout` whenever the window set or output size changes.
     pub layout_rects:      Vec<Rect>,
+    /// Parsed `keybinds` config (Combo 4). Super+/ (hardcoded, not itself
+    /// configurable) toggles `show_help`.
+    pub keybinds:          veil_config::Keybinds,
+    pub show_help:         bool,
+    /// Bare background color (RGBA, alpha always 255) — fills the composite
+    /// buffer before any window blit, so uncovered space is a solid color
+    /// instead of black.
+    pub background:        [u8; 4],
+    /// `<mod_key>+D` app launcher — `Some` while the modal is open. See
+    /// `crate::launcher`. Not itself a `keybinds` config entry, same as help.
+    pub launcher:          Option<Launcher>,
+    /// Own Wayland socket name, so launcher-spawned clients can connect back
+    /// into us (`WAYLAND_DISPLAY=<this>`).
+    pub socket_name:       String,
     pub popups:            PopupManager,
     pub surface_buffers:   HashMap<ObjectId, SurfaceBuf>,
     pub cursor_status:     CursorImageStatus,
@@ -709,6 +724,146 @@ fn blit_subtree(
     );
 }
 
+/// Lowercased ASCII char for a keysym, ignoring Shift — so a configured
+/// `"h"` bind matches whether or not the modifier chord also holds Shift.
+fn keysym_char(keysym: KeysymHandle<'_>) -> Option<char> {
+    let cp = smithay::input::keyboard::xkb::keysym_to_utf32(keysym.modified_sym());
+    char::from_u32(cp).map(|c| c.to_ascii_lowercase())
+}
+
+/// Run a Combo-4 keybind action against the live layout, then re-tile and
+/// re-focus so the client sees the result immediately.
+fn dispatch_action(state: &mut State, action: veil_config::Action) {
+    use veil_config::Action::*;
+    match action {
+        FocusLeft  => state.layout.focus(&state.layout_rects, crate::layout::Dir::Left),
+        FocusRight => state.layout.focus(&state.layout_rects, crate::layout::Dir::Right),
+        FocusUp    => state.layout.focus(&state.layout_rects, crate::layout::Dir::Up),
+        FocusDown  => state.layout.focus(&state.layout_rects, crate::layout::Dir::Down),
+        Swap => {
+            // swap_next's indices are positions among LIVE toplevels; map them
+            // back to real Vec indices in case a dead-but-unpruned entry sits
+            // between live ones.
+            let live_idx: Vec<usize> = state.toplevels.iter().enumerate()
+                .filter(|(_, t)| t.alive())
+                .map(|(i, _)| i)
+                .collect();
+            if let Some((a, b)) = state.layout.swap_next(live_idx.len()) {
+                state.toplevels.swap(live_idx[a], live_idx[b]);
+            }
+        }
+        Rotate => state.layout.rotate_split(),
+        Close => {
+            if let Some(tl) = state.toplevels.iter().filter(|t| t.alive()).nth(state.layout.focused) {
+                tl.send_close();
+            }
+        }
+        ResizeGrow   => state.layout.resize_grow(),
+        ResizeShrink => state.layout.resize_shrink(),
+    }
+    relayout(state);
+    refocus_keyboard(state);
+}
+
+/// Per-keystroke handling while the launcher modal is open. Navigation
+/// (Escape/Enter/Backspace/Up/Down) is xkb-keysym-coded; anything else that
+/// decodes to a printable Unicode codepoint is appended to the query as
+/// typed (shift-aware, NOT lowercased — unlike `keysym_char`, since command
+/// text is case-sensitive).
+fn handle_launcher_key(state: &mut State, mods: &ModifiersState, keysym: KeysymHandle<'_>) {
+    let sym = keysym.modified_sym().raw();
+
+    // <mod_key>+D closes the launcher too — same chord opens and closes it.
+    let mod_held = match state.keybinds.mod_key {
+        veil_config::ModKey::Super => mods.logo,
+        veil_config::ModKey::Ctrl  => mods.ctrl,
+        veil_config::ModKey::Alt   => mods.alt,
+        veil_config::ModKey::Shift => mods.shift,
+    };
+    if mod_held && matches!(sym, keysyms::KEY_d | keysyms::KEY_D) {
+        state.launcher = None;
+        state.dirty = true;
+        return;
+    }
+
+    if sym == keysyms::KEY_Escape {
+        state.launcher = None;
+        state.dirty = true;
+        return;
+    }
+    if sym == keysyms::KEY_Return || sym == keysyms::KEY_KP_Enter {
+        launch_selected(state);
+        return;
+    }
+    if sym == keysyms::KEY_BackSpace {
+        if let Some(l) = state.launcher.as_mut() {
+            l.query.pop();
+            l.selected = 0;
+            state.dirty = true;
+        }
+        return;
+    }
+    if sym == keysyms::KEY_Up {
+        if let Some(l) = state.launcher.as_mut() {
+            l.selected = l.selected.saturating_sub(1);
+            state.dirty = true;
+        }
+        return;
+    }
+    if sym == keysyms::KEY_Down {
+        if let Some(l) = state.launcher.as_mut() {
+            let count = l.matches().len();
+            if count > 0 { l.selected = (l.selected + 1).min(count - 1); }
+            state.dirty = true;
+        }
+        return;
+    }
+
+    let cp = smithay::input::keyboard::xkb::keysym_to_utf32(keysym.modified_sym());
+    if let Some(c) = char::from_u32(cp) {
+        if !c.is_control() {
+            if let Some(l) = state.launcher.as_mut() {
+                l.query.push(c);
+                l.selected = 0;
+                state.dirty = true;
+            }
+        }
+    }
+}
+
+/// Run whatever's selected: the highlighted `.desktop` match if there is
+/// one, else the raw typed query as a shell command. Fire-and-forget — the
+/// child is reaped on its own thread but never ties into veil's own
+/// lifetime (that coupling, on the ORIGINAL `run` spawn, is what stranded
+/// abyss when the last window closed).
+fn launch_selected(state: &mut State) {
+    let Some(launcher) = state.launcher.take() else { return };
+    state.dirty = true;
+
+    let matches = launcher.matches();
+    let exec = if !matches.is_empty() {
+        matches[launcher.selected.min(matches.len() - 1)].exec.clone()
+    } else if !launcher.query.trim().is_empty() {
+        launcher.query.clone()
+    } else {
+        return;
+    };
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(&exec);
+    cmd.env("WAYLAND_DISPLAY", &state.socket_name);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            tracing::info!("launcher: spawned {exec:?}");
+            std::thread::spawn(move || { let _ = child.wait(); });
+        }
+        Err(e) => tracing::error!("launcher: spawn {exec:?} failed: {e}"),
+    }
+}
+
 /// Recompute the dwindle tiling and push each toplevel its new size. Call
 /// whenever the live window set or the output size changes. Also marks the
 /// focused window Activated (others deactivated) so clients render focus state.
@@ -764,6 +919,11 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
     let w = state.output_w;
     let h = state.output_h;
     let mut back = vec![0u8; (w as usize) * (h as usize) * 4];
+    // Bare background — otherwise uncovered space is pure black, the "void"
+    // (see zero-toplevel launcher work: that's now a real, reachable state).
+    for px in back.chunks_exact_mut(4) {
+        px.copy_from_slice(&state.background);
+    }
 
     // Toplevels (root buffer + subsurfaces) then their popups, each at its
     // tiled rect origin. Popups are positioned relative to their toplevel.
@@ -806,6 +966,13 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
         CursorImageStatus::Hidden => {}
     }
 
+    if state.show_help {
+        draw_help_overlay(state, &mut back, w, h);
+    }
+    if let Some(launcher) = &state.launcher {
+        draw_launcher_overlay(launcher, state.keybinds.mod_key, &mut back, w, h);
+    }
+
     state.frame_serial = state.frame_serial.wrapping_add(1);
     let _ = state.frame_tx.send(Frame {
         rgba: back, width: w, height: h, serial: state.frame_serial,
@@ -828,6 +995,100 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
     }
 }
 
+/// `<mod_key>+/` help overlay: dumps the parsed `keybinds` config as an
+/// on-screen box, stamped directly into the composited RGBA frame with the
+/// built-in 5x7 font ([`crate::font5x7`]) — veil-host has no other text
+/// rendering.
+fn draw_help_overlay(state: &State, back: &mut [u8], w: u32, h: u32) {
+    use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
+
+    let scale = 2u32;
+    let advance = (GLYPH_W + 1) * scale;
+    let line_h = (GLYPH_H + 3) * scale;
+    let pad = 12i32;
+
+    let mod_label = state.keybinds.mod_key.label().to_ascii_uppercase();
+    let mut lines: Vec<String> = vec!["KEYBINDS".to_string(), String::new()];
+    for (key, action) in &state.keybinds.binds {
+        lines.push(format!("{mod_label}+{}  {}", key.to_ascii_uppercase(), action.label().to_ascii_uppercase()));
+    }
+    lines.push(String::new());
+    lines.push(format!("{mod_label}+/  TOGGLE THIS MENU"));
+    lines.push(format!("{mod_label}+D  APP LAUNCHER"));
+
+    let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u32;
+    let box_w = text_cols * advance + pad as u32 * 2;
+    let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
+    let x0 = ((w as i32 - box_w as i32) / 2).max(0);
+    let y0 = ((h as i32 - box_h as i32) / 2).max(0);
+
+    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 235]); // near-opaque #0a0010
+    for (i, line) in lines.iter().enumerate() {
+        let ty = y0 + pad + i as i32 * line_h as i32;
+        draw_text(back, w, h, x0 + pad, ty, scale, line, [199, 146, 234, 255]); // #c792ea
+    }
+}
+
+/// `<mod_key>+D` launcher modal: query box + top matches, same font/box
+/// style as the help overlay. Selected row gets a highlight bar.
+fn draw_launcher_overlay(launcher: &Launcher, mod_key: veil_config::ModKey, back: &mut [u8], w: u32, h: u32) {
+    use crate::font5x7::{draw_text, fill_rect, GLYPH_H, GLYPH_W};
+
+    const MAX_ROWS: usize = 8;
+    let scale = 2u32;
+    let advance = (GLYPH_W + 1) * scale;
+    let line_h = (GLYPH_H + 3) * scale;
+    let pad = 12i32;
+
+    let mod_label = mod_key.label().to_ascii_uppercase();
+    let matches = launcher.matches();
+    let selected = launcher.selected.min(matches.len().saturating_sub(1));
+
+    let mut lines: Vec<String> = vec![
+        format!("LAUNCHER  ({mod_label}+D CLOSE, ENTER RUN, ESC CANCEL)"),
+        format!("> {}_", launcher.query),
+        String::new(),
+    ];
+    let header_rows = lines.len();
+    if matches.is_empty() {
+        lines.push(if launcher.query.trim().is_empty() {
+            "NO APPS FOUND — TYPE A COMMAND".to_string()
+        } else {
+            "NO MATCH — ENTER RUNS AS SHELL COMMAND".to_string()
+        });
+    } else {
+        for m in matches.iter().take(MAX_ROWS) {
+            lines.push(m.name.clone());
+        }
+        if matches.len() > MAX_ROWS {
+            lines.push(format!("... {} MORE", matches.len() - MAX_ROWS));
+        }
+    }
+
+    let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(40) as u32;
+    let box_w = text_cols * advance + pad as u32 * 2;
+    let box_h = lines.len() as u32 * line_h + pad as u32 * 2;
+    let x0 = ((w as i32 - box_w as i32) / 2).max(0);
+    let y0 = ((h as i32 - box_h as i32) / 2).max(0);
+
+    fill_rect(back, w, h, x0, y0, box_w, box_h, [10, 0, 16, 235]); // near-opaque #0a0010
+
+    // Highlight bar behind the selected match row, drawn before the text.
+    // fill_rect overwrites pixels outright (nothing downstream alpha-blends
+    // an RGBA frame — DRM's blit drops A entirely), so this has to be a
+    // solid tint, not a translucent wash.
+    if !matches.is_empty() {
+        let row = header_rows + selected;
+        let ry = y0 + pad + row as i32 * line_h as i32 - 2;
+        fill_rect(back, w, h, x0 + 2, ry, box_w - 4, line_h, [40, 20, 52, 255]);
+    }
+
+    for (i, line) in lines.iter().enumerate() {
+        let ty = y0 + pad + i as i32 * line_h as i32;
+        draw_text(back, w, h, x0 + pad, ty, scale, line, [199, 146, 234, 255]); // #c792ea
+    }
+}
+
 fn send_frame_callbacks(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
         surface,
@@ -841,6 +1102,18 @@ fn send_frame_callbacks(surface: &WlSurface, time: u32) {
         },
         |_, _, &()| true,
     );
+}
+
+/// Which live toplevel's tiled rect contains `(x, y)`, if any. Returns a
+/// live-order index — matches `layout_rects`/`layout.focused`, NOT a raw
+/// `toplevels` Vec index (see the `live_idx` mapping in `dispatch_action`
+/// and the click-to-focus handling in `apply_input`).
+fn toplevel_at(state: &State, x: f64, y: f64) -> Option<usize> {
+    let xi = x as i32;
+    let yi = y as i32;
+    state.layout_rects.iter().position(|r| {
+        xi >= r.x && yi >= r.y && xi < r.x + r.w as i32 && yi < r.y + r.h as i32
+    })
 }
 
 /// Walk all toplevels' popups (newest first) then the toplevel root.
@@ -901,7 +1174,58 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
             let kb = state.keyboard.clone();
             kb.input::<(), _>(
                 state, (keycode + 8).into(), ks, serial, time,
-                |_, _: &ModifiersState, _: KeysymHandle<'_>| FilterResult::Forward,
+                |st, mods: &ModifiersState, keysym: KeysymHandle<'_>| {
+                    // Launcher modal: swallow ALL key input while it's open
+                    // (typed query text, arrow-key selection, Enter/Escape),
+                    // so the hosted client (if any) never sees it and text
+                    // typed into the query box can't leak through as
+                    // keystrokes to whatever's focused underneath.
+                    if st.launcher.is_some() {
+                        if pressed {
+                            handle_launcher_key(st, mods, keysym);
+                        }
+                        return FilterResult::Intercept(());
+                    }
+
+                    if !pressed {
+                        return FilterResult::Forward;
+                    }
+                    let Some(ch) = keysym_char(keysym) else {
+                        return FilterResult::Forward;
+                    };
+
+                    let mod_held = match st.keybinds.mod_key {
+                        veil_config::ModKey::Super => mods.logo,
+                        veil_config::ModKey::Ctrl  => mods.ctrl,
+                        veil_config::ModKey::Alt   => mods.alt,
+                        veil_config::ModKey::Shift => mods.shift,
+                    };
+                    if mod_held {
+                        // Help overlay and the launcher both ride whatever
+                        // mod_key is configured rather than a hardcoded
+                        // Super — neither is a `keybinds` config entry, but
+                        // NOT literally Super: crossterm terminal mode can
+                        // never see the Logo key (the WM eats it before it
+                        // reaches the terminal), so a hardcoded Super+key
+                        // would be dead in terminal mode. Following mod_key
+                        // means it works in whatever mode's actually in use.
+                        if ch == '/' {
+                            st.show_help = !st.show_help;
+                            st.dirty = true;
+                            return FilterResult::Intercept(());
+                        }
+                        if ch == 'd' {
+                            st.launcher = Some(Launcher::new());
+                            st.dirty = true;
+                            return FilterResult::Intercept(());
+                        }
+                        if let Some(action) = st.keybinds.action_for(ch) {
+                            dispatch_action(st, action);
+                            return FilterResult::Intercept(());
+                        }
+                    }
+                    FilterResult::Forward
+                },
             );
         }
 
@@ -928,6 +1252,25 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
 
         InputCmd::PointerButton { button, pressed } => {
             let bs = if pressed { BState::Pressed } else { BState::Released };
+
+            // Left-click on a tile makes it the focused one — just follows
+            // click focus, no position rearranging (that's what Alt+S is
+            // for). Keeps `layout.focused` in sync with clicks so keyboard
+            // nav/close (Alt+H/J/K/L/Q) act on whatever you last clicked,
+            // not whatever keyboard nav last visited. A click inside the
+            // already-focused tile hits `idx == layout.focused` and no-ops,
+            // so ordinary clicks/typing inside an app are unaffected.
+            const BTN_LEFT: u32 = 0x110;
+            if pressed && button == BTN_LEFT {
+                if let Some(idx) = toplevel_at(state, state.pointer_pos.0, state.pointer_pos.1) {
+                    if idx != state.layout.focused {
+                        state.layout.focused = idx;
+                        relayout(state);
+                        refocus_keyboard(state);
+                    }
+                }
+            }
+
             let focus = state.pointer.current_focus();
             tracing::info!(
                 "button 0x{:x} pressed={} pos=({:.0},{:.0}) focus={:?}",
@@ -990,6 +1333,8 @@ pub fn run(
     frame_tx: mpsc::Sender<Frame>,
     input_rx: mpsc::Receiver<InputCmd>,
     stop: Arc<AtomicBool>,
+    keybinds: veil_config::Keybinds,
+    background: [u8; 3],
 ) -> io::Result<()> {
     let composite_interval = Duration::from_millis(1000 / fps.max(1) as u64);
     let display: Display<State> = Display::new()
@@ -1085,6 +1430,11 @@ pub fn run(
         toplevels: Vec::new(),
         layout: Layout::default(),
         layout_rects: Vec::new(),
+        keybinds,
+        show_help: false,
+        background: [background[0], background[1], background[2], 255],
+        launcher: None,
+        socket_name: socket_name.to_string(),
         popups:           PopupManager::default(),
         surface_buffers:  HashMap::new(),
         cursor_status:    CursorImageStatus::default_named(),
@@ -1257,13 +1607,20 @@ pub fn run(
             match cmd.spawn() {
                 Ok(mut child) => {
                     tracing::info!("spawned: {:?}", argv);
-                    let stop_child = stop.clone();
+                    // Reap on exit but DON'T touch `stop` — this was the
+                    // "abyss" bug: veil used to tear the WHOLE compositor
+                    // down the instant this one (anchor) client exited, even
+                    // with other windows still open (from the Alt+D launcher
+                    // or `run -a`), which could stutter/freeze/crash instead
+                    // of a clean exit. Made sense for the old one-shot `run
+                    // firefox`-and-wait model; doesn't anymore now that Alt+D
+                    // makes this a persistent session. Only HOME/Ctrl-C
+                    // should ever stop veil now.
                     std::thread::spawn(move || {
                         match child.wait() {
-                            Ok(s)  => tracing::info!("child exited: {s}"),
-                            Err(e) => tracing::error!("child wait: {e}"),
+                            Ok(s)  => tracing::info!("anchor client exited: {s} (veil keeps running)"),
+                            Err(e) => tracing::error!("anchor client wait: {e}"),
                         }
-                        stop_child.store(true, Ordering::Relaxed);
                     });
                 }
                 Err(e) => tracing::error!("spawn {:?} failed: {e}", argv),
@@ -1279,6 +1636,12 @@ pub fn run(
             data.state.running = false;
         }
     }).map_err(|e| io::Error::other(format!("run: {e}")))?;
+
+    // Belt-and-suspenders: every intentional shutdown path (HOME, Ctrl-C)
+    // already calls this directly, and crashes go through the panic
+    // hook/signal handlers — but cover whatever exit route got us here too.
+    // Idempotent; unlinking an already-gone socket is a harmless no-op.
+    crate::vt::emergency_restore();
 
     Ok(())
 }

@@ -66,6 +66,12 @@ impl InputBackend for EvdevInput {
         let mut cx = (geom.comp_w.load(Ordering::Relaxed) / 2) as i32;
         let mut cy = (geom.comp_h.load(Ordering::Relaxed) / 2) as i32;
 
+        // Ctrl/Alt held-state for the Ctrl+Alt+Fn VT-switch chord (see
+        // handle_event). The exclusive grab below eats this chord before the
+        // kernel's own VT switching ever sees it, so we emulate it ourselves.
+        let mut ctrl_held = false;
+        let mut alt_held = false;
+
         // Poll the device fds directly instead of busy-polling with a sleep.
         // The kernel wakes us the instant an event lands, so we drain promptly
         // even when the rest of veil is CPU-saturated compositing a nested
@@ -102,7 +108,10 @@ impl InputBackend for EvdevInput {
                 };
                 for ev in events {
                     if active {
-                        handle_event(&tx, ev, &geom, &mut cx, &mut cy, &running, &host_stop);
+                        handle_event(
+                            &tx, ev, &geom, &mut cx, &mut cy, &running, &host_stop,
+                            &mut ctrl_held, &mut alt_held,
+                        );
                     }
                 }
             }
@@ -119,6 +128,8 @@ fn handle_event(
     cy: &mut i32,
     running: &std::sync::atomic::AtomicBool,
     host_stop: &std::sync::atomic::AtomicBool,
+    ctrl_held: &mut bool,
+    alt_held: &mut bool,
 ) {
     match ev.destructure() {
         EventSummary::Key(_, key, value) => {
@@ -126,6 +137,21 @@ fn handle_event(
             if value == 2 { return; }
             let pressed = value == 1;
             let code = key.code();
+
+            if code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL { *ctrl_held = pressed; }
+            if code == KEY_LEFTALT || code == KEY_RIGHTALT { *alt_held = pressed; }
+
+            // VT switch chord: swallow it here rather than forward it — the
+            // exclusive grab means the kernel/console never gets a chance to
+            // act on it, so we drive libseat's switch_session ourselves via
+            // the seat module's atomic handoff (DrmOutput owns the !Send
+            // Seat on the main thread and consumes this once per frame).
+            if *ctrl_held && *alt_held && pressed {
+                if let Some(vt) = vt_for_fkey(code) {
+                    crate::seat::request_vt_switch(vt);
+                    return;
+                }
+            }
 
             // Compositor kill key. Ctrl-C is forwarded to the hosted app (it
             // never reaches us on a TTY), so HOME is the escape hatch: it always
@@ -187,3 +213,21 @@ fn is_button(key: KeyCode) -> bool {
 
 /// evdev KEY_HOME (linux/input-event-codes.h) — our compositor kill key.
 const KEY_HOME: u16 = 102;
+
+// linux/input-event-codes.h — modifier + function-key codes for the
+// Ctrl+Alt+Fn VT-switch chord.
+const KEY_LEFTCTRL: u16 = 29;
+const KEY_LEFTALT: u16 = 56;
+const KEY_RIGHTCTRL: u16 = 97;
+const KEY_RIGHTALT: u16 = 100;
+
+/// Map KEY_F1..KEY_F12 to their VT number (F1 → VT 1, etc). F1..F10 are
+/// contiguous (59..=68); F11/F12 are non-contiguous (87, 88).
+fn vt_for_fkey(code: u16) -> Option<i32> {
+    match code {
+        59..=68 => Some((code - 59 + 1) as i32),
+        87 => Some(11),
+        88 => Some(12),
+        _ => None,
+    }
+}

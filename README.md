@@ -1,7 +1,8 @@
 # veil
 
-**Nested Wayland compositor → terminal renderer.**
-Run any GUI app inside your terminal — full colour, live input, clipboard, resize.
+**Nested Wayland compositor → terminal / bare-TTY renderer.**
+Run GUI apps inside your terminal (or straight to a bare TTY framebuffer) —
+full colour, live input, clipboard, tiling, resize.
 
 > [!IMPORTANT]
 > **AI-Assisted Project:** Developed with AI assistance. Code reviewed but not guaranteed production-ready.
@@ -17,12 +18,14 @@ Run any GUI app inside your terminal — full colour, live input, clipboard, res
 `veil-host` is a Smithay-based nested Wayland compositor. It:
 
 1. Opens its own `WAYLAND_DISPLAY` socket
-2. Spawns the target app pointed at that socket
+2. Spawns the target app(s) pointed at that socket — up to 4 tiled toplevels, dwindle-style
 3. Receives SHM buffer commits (shm path; GPU/dmabuf apps fall back to software automatically)
-4. Composites surfaces + subsurfaces + popups + cursor into a single RGBA frame
-5. Encodes and streams that frame to the terminal via Kitty graphics / half-block Unicode / ASCII
+4. Composites surfaces + subsurfaces + popups + cursor + a configurable background into a single RGBA frame
+5. Sends that frame to one of two output backends:
+   - **Terminal**: Kitty graphics protocol / half-block Unicode / ASCII, over your existing terminal emulator
+   - **DRM/KMS**: direct framebuffer on a bare TTY (own VT, `libseat`-managed), for running without any host compositor or terminal at all
 
-Input flows back: keyboard, mouse (click, drag, scroll), and clipboard (both directions) are fully bridged.
+Input flows back: keyboard, mouse (click, drag, scroll), and clipboard (both directions) are fully bridged. On bare TTY, `Ctrl+Alt+F1`–`F12` switches VTs normally — veil suspends/resumes DRM output around the switch instead of eating the keys.
 
 ---
 
@@ -31,12 +34,19 @@ Input flows back: keyboard, mouse (click, drag, scroll), and clipboard (both dir
 ```
 veil/
 ├── veil-host/      Smithay nested compositor + standalone binary
-│   ├── server.rs       Wayland globals, dispatch loop, software compositor
-│   ├── main.rs         Terminal I/O, render dispatch, CLI
-│   ├── input.rs        InputCmd enum
-│   └── sink.rs         Frame struct
+│   ├── server.rs        Wayland globals, dispatch loop, software compositor, overlays
+│   ├── main.rs           CLI, config resolution, output dispatch
+│   ├── layout.rs         Dwindle tiling (up to 4 windows) + resize
+│   ├── input.rs          InputCmd enum
+│   ├── input_backend/    Terminal stdin + evdev (bare-TTY) input sources
+│   ├── output/           TerminalOutput (kitty/halfblock/ascii) + DrmOutput (DRM/KMS)
+│   ├── launcher.rs        Alt+D app launcher (.desktop scan + raw command exec)
+│   ├── lockfile.rs        Single-instance lock, -O override, -a auto-discovery
+│   ├── font5x7.rs         Bitmap font for the help/launcher overlays
+│   ├── seat.rs / vt.rs    libseat session + VT switch handling
+│   └── sink.rs            Frame struct
 ├── veil-render/    Render engines (kitty, halfblock, ascii, ascii-edge)
-└── veil-config/    Lua config loader + terminal auto-detection
+└── veil-config/    Lua config loader, keybinds, output/quality/background parsing
 ```
 
 ### Compositor globals
@@ -51,7 +61,7 @@ veil/
 | `wl_output` + `xdg_output` | ✓ full |
 | `xdg_activation` | ✓ stub (always grant) |
 | `xdg_decoration` | ✓ client-side always |
-| `zwp_linux_dmabuf_v1` | stub — advertised, every import fails → shm fallback |
+| `zwp_linux_dmabuf_v1` | GPU import (GBM/EGL) with shm fallback on failure |
 | `wp_viewporter` / `wp_fractional_scale` / `wp_presentation_time` | globals only |
 | XWayland | ✓ spawned at startup, X11 apps work |
 
@@ -85,7 +95,7 @@ VERSION=v0.1.0 curl -fsSL .../install.sh | bash
 
 ### From source
 
-Requirements: Rust stable, a Wayland compositor running (Niri, Hyprland, etc.).
+Requirements: Rust stable. Runs nested under any Wayland/X11 compositor (Niri, Hyprland, etc.), or standalone on a bare TTY with a real GPU (DRM/KMS + `libseat`).
 
 ```bash
 git clone https://github.com/viewerofall/veilTDC.git
@@ -111,20 +121,68 @@ veil-host run thunar
 veil-host run firefox
 veil-host run weston-terminal
 
+# Add a second app to the running instance (tiles alongside the first, up to 4)
+veil-host run -a dolphin
+
 # Flags
-veil-host run -d thunar                  # debug log → /tmp/veil.log
+veil-host run -d thunar                  # debug log → $XDG_STATE_HOME/veil/veil.log
 veil-host run -m halfblock thunar        # force render mode
 veil-host run -m ascii-edge thunar       # edge-detection ascii
 veil-host run -w 1920 -h 1080 thunar     # explicit compositor resolution
 veil-host run -s wayland-veil-1 thunar   # custom socket name
+veil-host run -O -s wayland-veil-2 xterm # second, unregistered instance (bypasses the lock)
 
 # Probe terminal capabilities and resolved config
 veil-host probe
+veil-host list-modes
 ```
 
-The compositor size defaults to `terminal_cols × 8` × `terminal_rows × 16` (standard 8×16 cell assumption). Resize the terminal window and the compositor reconfigures live.
+Press `Ctrl+C`, or use the configured `close` keybind on the last window, to exit — veil-host shuts down cleanly and wipes its socket and lock file no matter how it exits (normal quit, signal, or crash).
 
-Press `Ctrl+C` to exit. veil-host shuts down automatically when the hosted app exits.
+### Single instance / lock file
+
+Running `veil-host run` a second time on the default socket refuses to start and tells you an instance is already running (PID + socket, read from the lock file). Options:
+
+- `-a` / `--append` — don't start a new compositor, launch the app into the already-running one instead. With no `-s`, it auto-discovers the socket name from the lock file, so it works across VTs without you tracking the socket name yourself.
+- `-O` / `--override` — bypass the lock and start a second, independent instance. It's unregistered (no lock file), so it needs its own `-s` to bind (the default socket's taken), and `-a` auto-discovery can't find it — reach it with an explicit `-s` on both ends.
+
+### Multi-app tiling
+
+Up to 4 toplevels tile in a dwindle layout automatically as you add/close them:
+
+```
+1 → fullscreen
+2 → left / right split
+3 → left half + right column split in two
+4 → 2×2 grid
+```
+
+A 5th window stacks on the last cell. Click a tile to focus it.
+
+### Keybinds
+
+Set in `config.lua`'s `keybinds` table (see below) — held modifier + a single key. A hardcoded help overlay lists the live config: `<mod_key>+/`.
+
+| Action | Default key |
+|---|---|
+| Focus left/right/up/down | `h` / `l` / `k` / `j` |
+| Swap with neighbor | `s` |
+| Rotate split axis | `r` |
+| Close focused window | `q` |
+| Grow / shrink primary pane | `=` / `-` |
+| Help overlay | `/` |
+| App launcher | `d` |
+| Quit | `Ctrl+C` (always `Ctrl`, independent of `mod_key`) |
+
+> In terminal mode (nested under a WM), use `mod_key = "alt"` or `"ctrl"` — terminals never forward the Super/Logo key, the WM eats it first. `"super"` only works in bare-TTY (DRM/evdev) mode.
+
+### App launcher
+
+`<mod_key>+d` opens a panel listing installed `.desktop` entries (scanned from standard XDG app dirs) plus a raw command box — type and run anything. Meant to get you out of a zero-window state without touching a second terminal.
+
+### VT switching (bare TTY / DRM mode)
+
+`Ctrl+Alt+F1`–`F12` switches virtual terminals like normal — veil-host intercepts it, suspends DRM output, hands off via `libseat`, and resumes cleanly when you switch back.
 
 ---
 
@@ -145,6 +203,15 @@ Without `-m`, the mode is resolved automatically:
    - `truecolor` / `24bit` → Halfblock
    - Otherwise → ASCII
 
+## Output backend
+
+Independent of render mode — decides *where* frames go, not how they're drawn:
+
+- **Terminal** — draws into your existing terminal emulator via the render mode above.
+- **DRM/KMS** — direct framebuffer on a bare TTY, no terminal involved at all. Needs `libseat` and `/dev/dri` access.
+
+Resolution order: `VEIL_OUTPUT` env var (`drm`/`terminal`, always wins, errors loudly on failure) → `output` in `config.lua` (`"drm"`/`"terminal"`, persistent equivalent, but never overrides the nested-compositor check) → auto-detect (nested Wayland/X11 env → terminal; SSH session → terminal; otherwise try DRM/KMS, fall back to terminal on failure).
+
 ---
 
 ## config.lua
@@ -152,8 +219,30 @@ Without `-m`, the mode is resolved automatically:
 Place at `./config.lua` or `~/.config/veil/config.lua`.
 
 ```lua
-quality = "auto"   -- auto | kitty | pixel | ascii | ascii_edge | ascii_luma
-fps     = 60       -- compositor frame rate cap
+quality           = "auto"   -- auto | kitty | pixel | ascii | ascii_edge
+fps               = 60       -- compositor frame rate cap
+cage_timeout_secs = 8        -- timeout for caged output
+input             = true     -- enable input forwarding
+gpu_render        = true     -- use GPU for frame encoding
+
+background = "#8c8c8c"       -- hex "#RRGGBB" or "RRGGBB" — shown wherever no window covers
+
+output = "auto"              -- auto | drm | terminal
+
+keybinds = {
+  mod_key       = "alt",     -- shift | ctrl | alt | super
+  focus_left    = "h",
+  focus_right   = "l",
+  focus_up      = "k",
+  focus_down    = "j",
+  swap          = "s",
+  rotate        = "r",
+  close         = "q",
+  resize_grow   = "=",
+  resize_shrink = "-",
+}
+-- Help overlay (<mod_key>+/) and app launcher (<mod_key>+d) are hardcoded,
+-- not themselves config entries.
 ```
 
 `veil-host probe` shows which config file was loaded and the resolved mode.
@@ -194,17 +283,16 @@ Full bidirectional bridge:
 
 ## Limitations
 
-- **dmabuf / GPU import** — Chromium, Electron, Firefox require `zwp_linux_dmabuf_v1` with real GBM/EGL import. Planned for v1.5. For now, set `LIBGL_ALWAYS_SOFTWARE=1` (done automatically) to push them to shm.
-- **Single app** — one toplevel client per compositor instance. Multi-app support is a v2 goal.
-- **Cell resolution mouse** — terminal mouse events are cell-granularity, not pixel-granularity.
+- **Cell resolution mouse** — under terminal output, mouse events are cell-granularity, not pixel-granularity (DRM/KMS output is full pixel resolution).
+- **4-window tiling cap** — a 5th+ window stacks on the last cell rather than adding a new tile.
 
 ---
 
 ## What's next
 
-- **v1.5** — real dmabuf import (GBM + EGL) for GPU apps
-- **v2** — multi-app support, `veil-cli` migration to consume veil-host
-- **Expansion** — Linux TTY / framebuffer sink, Sixel, iTerm2 protocol
+- Sixel / iTerm2 protocol render modes
+- AT-SPI text overlay accessibility pass
+- `veil-cli` migration to consume veil-host
 
 ---
 

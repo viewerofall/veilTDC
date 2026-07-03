@@ -44,7 +44,14 @@ fn print_help() {
     println!();
     println!("RUN FLAGS");
     println!("  -a, --append              Add the app to an already-running veil instance");
-    println!("                            (launches against its socket; works cross-VT)");
+    println!("                            (launches against its socket; works cross-VT).");
+    println!("                            No -s: auto-discovers the socket from the lock");
+    println!("                            file — pass -s explicitly to reach an -O instance.");
+    println!("  -O, --override            Run without the single-instance lock file. Lets a");
+    println!("                            second instance run alongside the default one, but");
+    println!("                            it's unregistered: -a auto-discovery won't find it");
+    println!("                            (pass -s on both ends), and it needs its own -s to");
+    println!("                            bind at all, since the default socket's taken.");
     println!("  -m, --mode <mode>         Force a render mode (see list-modes for options)");
     println!("  -d, --debug               Redirect all logs to $XDG_STATE_HOME/veil/veil.log");
     println!("  -w, --width <px>          Override compositor width  (default: cols × 8)");
@@ -61,6 +68,7 @@ fn print_help() {
     println!("  veil-host run -a dolphin          # add to a running instance (any VT)");
     println!("  veil-host run -d -m halfblock firefox");
     println!("  veil-host run --stats nautilus");
+    println!("  veil-host run -O -s wayland-veil-2 weston-terminal   # second, unregistered instance");
     println!("  veil-host probe");
     println!("  veil-host list-modes");
     println!();
@@ -88,7 +96,9 @@ fn main() -> std::io::Result<()> {
     let mut debug      = false;
     let mut spawn: Vec<String> = Vec::new();
     let mut explicit_size = false;
+    let mut explicit_socket = false;
     let mut append     = false;
+    let mut override_lock = false;
 
     while let Some(a) = raw_args.next() {
         if !spawn.is_empty() { spawn.push(a); continue; }
@@ -96,6 +106,7 @@ fn main() -> std::io::Result<()> {
             "--help"          => { print_help(); return Ok(()); }
             "-a" | "--append" => { append = true; }
             "-d" | "--debug"  => { debug = true; cfg.wayland_debug = true; }
+            "-O" | "--override" => { override_lock = true; }
             "-w" | "--width"  => {
                 cfg.width = raw_args.next().and_then(|s| s.parse().ok()).unwrap_or(cfg.width);
                 explicit_size = true;
@@ -106,6 +117,7 @@ fn main() -> std::io::Result<()> {
             }
             "-s" | "--socket" => {
                 cfg.socket_name = raw_args.next().unwrap_or_else(|| { eprintln!("--socket requires a value"); std::process::exit(2); });
+                explicit_socket = true;
             }
             other if other.starts_with('-') => { eprintln!("unknown flag: {other}\nrun 'veil-host --help' for usage"); std::process::exit(2); }
             cmd => { spawn.push(cmd.to_string()); }
@@ -115,15 +127,48 @@ fn main() -> std::io::Result<()> {
 
     // --append: don't start a compositor — launch the app against an
     // already-running veil instance's socket and exit. Works cross-VT because
-    // the socket lives in the shared per-user $XDG_RUNTIME_DIR.
+    // the socket lives in the shared per-user $XDG_RUNTIME_DIR. No explicit
+    // -s: auto-discover the socket name from the lock file (the registered
+    // default instance) instead of assuming "wayland-veil-0" — falls back to
+    // the default if there's no live lock (matches prior behavior, so a
+    // pre-lockfile / -O instance on the default name still attaches fine).
     if append {
-        if let Err(e) = attach(&cfg.socket_name, &spawn) {
+        let socket = if explicit_socket {
+            cfg.socket_name.clone()
+        } else {
+            veil_host::lockfile::read_live()
+                .map(|info| info.socket_name)
+                .unwrap_or(cfg.socket_name)
+        };
+        if let Err(e) = attach(&socket, &spawn) {
             eprintln!("[veil-host] {e}");
             std::process::exit(1);
         }
         return Ok(());
     }
+
+    // Enforce the single-default-instance rule (skipped entirely by -O,
+    // which also means this run won't be found by `-a` auto-discovery
+    // above — pass -s explicitly on both ends for an -O instance).
+    veil_host::lockfile::acquire_or_exit(&cfg.socket_name, override_lock);
+
     cfg.spawn = Some(spawn);
+
+    // Load config.lua (see `config_path()`) for keybinds + output pref etc.
+    // Falls back to defaults if no config file is found or it fails to parse.
+    let vcfg = load_veil_config();
+    cfg.keybinds = vcfg.keybinds.clone();
+    cfg.background = vcfg.background;
+
+    // Register our socket for cleanup on ANY exit (clean shutdown, HOME,
+    // Ctrl-C, or a crash) and install the panic/fatal-signal hooks that
+    // trigger it — unconditionally, both output modes, not just DRM (see
+    // vt.rs's module doc). Must happen before Host::spawn binds the socket,
+    // so even a startup crash is covered.
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        veil_host::vt::set_socket_path(&format!("{runtime_dir}/{}", cfg.socket_name));
+    }
+    veil_host::vt::install_handlers();
 
     // ── Debug mode: redirect stderr into the persistent log so it doesn't corrupt output.
     if debug { init_debug_log()?; }
@@ -183,7 +228,7 @@ fn main() -> std::io::Result<()> {
     }
 
     // ── Create output backend (auto-detect terminal vs DRM/KMS) ────────────────
-    let mut output = veil_host::output::detect()?;
+    let mut output = veil_host::output::detect(vcfg.output)?;
     let (out_w, out_h) = output.get_size();
     eprintln!("[veil-host] output backend initialized: {}x{}", out_w, out_h);
 
@@ -296,6 +341,26 @@ fn dirs_config() -> std::path::PathBuf {
         .join("veil")
 }
 
+/// Single canonical config resolution, used by every command that reads
+/// config.lua (`run`, `probe`). `~/.config/veil/config.lua` (or
+/// `$XDG_CONFIG_HOME/veil/config.lua`) is authoritative; `./config.lua` in
+/// the cwd is a dev-convenience override checked first so a repo checkout
+/// can test its own config.lua without installing it.
+fn config_path() -> Option<std::path::PathBuf> {
+    [
+        std::path::PathBuf::from("config.lua"),
+        dirs_config().join("config.lua"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+}
+
+fn load_veil_config() -> veil_config::VeilConfig {
+    config_path()
+        .map(|p| veil_config::load(&p))
+        .unwrap_or_default()
+}
+
 // ─── list-modes ───────────────────────────────────────────────────────────────
 
 fn cmd_list_modes() {
@@ -338,15 +403,8 @@ fn cmd_probe() -> std::io::Result<()> {
     let wayland   = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".into());
     let display   = std::env::var("DISPLAY").unwrap_or_else(|_| "unset".into());
 
-    let config_path = [
-        std::path::PathBuf::from("config.lua"),
-        dirs_config().join("config.lua"),
-    ]
-    .iter()
-    .find(|p| p.exists())
-    .cloned();
-
-    let vcfg = config_path.as_ref()
+    let cfg_path = config_path();
+    let vcfg = cfg_path.as_ref()
         .map(|p| veil_config::load(p))
         .unwrap_or_default();
 
@@ -362,7 +420,7 @@ fn cmd_probe() -> std::io::Result<()> {
     println!("config quality  : {}", format!("{:?}", vcfg.quality));
     println!("fps             : {}", vcfg.fps);
     println!("gpu_render      : {}", if vcfg.gpu_render { "on (default)" } else { "off" });
-    println!("config file     : {}", config_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (using defaults)".into()));
+    println!("config file     : {}", cfg_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (using defaults)".into()));
     println!("WAYLAND_DISPLAY : {wayland}");
     println!("DISPLAY         : {display}");
     println!("SSH_CLIENT      : {}", if ssh_mode { "yes (using terminal output)" } else { "no" });

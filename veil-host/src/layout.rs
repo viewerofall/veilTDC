@@ -36,13 +36,30 @@ pub enum Dir {
     Down,
 }
 
+/// `split_ratio` bounds — never let the primary pane shrink to nothing or
+/// swallow the whole output.
+const MIN_RATIO: f32 = 0.1;
+const MAX_RATIO: f32 = 0.9;
+/// Per-keypress adjustment for `resize_grow`/`resize_shrink`.
+const RESIZE_STEP: f32 = 0.05;
+
 /// Tiling state not derivable from the window list.
-#[derive(Default)]
 pub struct Layout {
     /// Index (into the live-toplevel order) of the focused window.
     pub focused: usize,
     /// `rotate_split` toggles this — flips the primary split axis.
     pub flip: bool,
+    /// Primary pane's share of the OUTERMOST split only — adjusted by
+    /// `resize_grow`/`resize_shrink` (Super+=/-). The secondary split (the
+    /// stack's internal top/bottom for n=3, the whole n=4 grid) always stays
+    /// a fixed 50/50; this is dwm-style "mfact", not per-pane resizing.
+    pub split_ratio: f32,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self { focused: 0, flip: false, split_ratio: 0.5 }
+    }
 }
 
 impl Layout {
@@ -53,39 +70,50 @@ impl Layout {
             return Vec::new();
         }
         let full = Rect { x: 0, y: 0, w, h };
-        // Split points chosen so the two halves sum back to the full extent
-        // exactly (no lost pixel column/row from integer division).
-        let lw = w / 2;
-        let rw = w - lw;
-        let th = h / 2;
-        let bh = h - th;
+
+        // Primary split (the outermost one) honors split_ratio; the
+        // secondary split — subdividing whichever pane ISN'T primary —
+        // always stays fixed 50/50. Both ratio and half variants computed
+        // up front; each arm below picks whichever pair is "primary" for
+        // its axis (columns when not flipped, rows when flipped).
+        let ratio = self.split_ratio.clamp(MIN_RATIO, MAX_RATIO);
+        let pw = ((w as f32) * ratio).round() as u32;
+        let sw = w - pw;
+        let ph = ((h as f32) * ratio).round() as u32;
+        let sh = h - ph;
+        let hw = w / 2;
+        let hw2 = w - hw;
+        let hh = h / 2;
+        let hh2 = h - hh;
 
         let mut base: Vec<Rect> = match n {
             1 => vec![full],
             2 if self.flip => vec![
-                Rect { x: 0, y: 0,          w, h: th },
-                Rect { x: 0, y: th as i32,  w, h: bh },
+                Rect { x: 0, y: 0,          w, h: ph },
+                Rect { x: 0, y: ph as i32,  w, h: sh },
             ],
             2 => vec![
-                Rect { x: 0,          y: 0, w: lw, h },
-                Rect { x: lw as i32,  y: 0, w: rw, h },
+                Rect { x: 0,         y: 0, w: pw, h },
+                Rect { x: pw as i32, y: 0, w: sw, h },
             ],
             3 if self.flip => vec![
-                Rect { x: 0,          y: 0,         w,      h: th },
-                Rect { x: 0,          y: th as i32, w: lw,  h: bh },
-                Rect { x: lw as i32,  y: th as i32, w: rw,  h: bh },
+                Rect { x: 0,          y: 0,         w,       h: ph },
+                Rect { x: 0,          y: ph as i32, w: hw,   h: sh },
+                Rect { x: hw as i32,  y: ph as i32, w: hw2,  h: sh },
             ],
             3 => vec![
-                Rect { x: 0,          y: 0,          w: lw, h },
-                Rect { x: lw as i32,  y: 0,          w: rw, h: th },
-                Rect { x: lw as i32,  y: th as i32,  w: rw, h: bh },
+                Rect { x: 0,          y: 0,          w: pw, h },
+                Rect { x: pw as i32,  y: 0,          w: sw, h: hh },
+                Rect { x: pw as i32,  y: hh as i32,  w: sw, h: hh2 },
             ],
             // 4+ → 2×2 grid; extras stack on the bottom-right cell below.
+            // Grid is NOT split_ratio-adjustable — always fixed 50/50, same
+            // as before resize existed.
             _ => vec![
-                Rect { x: 0,         y: 0,         w: lw, h: th },
-                Rect { x: lw as i32, y: 0,         w: rw, h: th },
-                Rect { x: 0,         y: th as i32, w: lw, h: bh },
-                Rect { x: lw as i32, y: th as i32, w: rw, h: bh },
+                Rect { x: 0,         y: 0,         w: hw,  h: hh },
+                Rect { x: hw as i32, y: 0,         w: hw2, h: hh },
+                Rect { x: 0,         y: hh as i32, w: hw,  h: hh2 },
+                Rect { x: hw as i32, y: hh as i32, w: hw2, h: hh2 },
             ],
         };
 
@@ -95,6 +123,16 @@ impl Layout {
             base.push(last);
         }
         base
+    }
+
+    /// Grow the primary pane's share of the outermost split.
+    pub fn resize_grow(&mut self) {
+        self.split_ratio = (self.split_ratio + RESIZE_STEP).min(MAX_RATIO);
+    }
+
+    /// Shrink the primary pane's share of the outermost split.
+    pub fn resize_shrink(&mut self) {
+        self.split_ratio = (self.split_ratio - RESIZE_STEP).max(MIN_RATIO);
     }
 
     /// Move focus to the nearest window in `dir`, using rect centers. No-op if
@@ -170,7 +208,7 @@ mod tests {
 
     #[test]
     fn flip_splits_top_bottom() {
-        let l = Layout { focused: 0, flip: true };
+        let l = Layout { focused: 0, flip: true, ..Default::default() };
         let r = l.rects(2, 100, 80);
         assert_eq!(r[0], Rect { x: 0, y: 0, w: 100, h: 40 });
         assert_eq!(r[1], Rect { x: 0, y: 40, w: 100, h: 40 });
@@ -239,5 +277,51 @@ mod tests {
         assert_eq!(l.swap_next(3), Some((2, 0)));
         assert_eq!(l.focused, 0);
         assert_eq!(l.swap_next(1), None);
+    }
+
+    #[test]
+    fn resize_grows_and_shrinks_primary_pane() {
+        let mut l = Layout::default();
+        l.resize_grow();
+        let r = l.rects(2, 100, 80);
+        assert!(r[0].w > 50); // primary pane bigger than default 50/50
+        assert_eq!(r[0].w + r[1].w, 100); // still covers the full width
+
+        let mut l = Layout::default();
+        l.resize_shrink();
+        let r = l.rects(2, 100, 80);
+        assert!(r[0].w < 50);
+        assert_eq!(r[0].w + r[1].w, 100);
+    }
+
+    #[test]
+    fn resize_clamps_at_bounds() {
+        let mut l = Layout::default();
+        for _ in 0..50 { l.resize_grow(); }
+        assert!((l.split_ratio - MAX_RATIO).abs() < f32::EPSILON);
+
+        let mut l = Layout::default();
+        for _ in 0..50 { l.resize_shrink(); }
+        assert!((l.split_ratio - MIN_RATIO).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn resize_does_not_affect_2x2_grid() {
+        let mut l = Layout::default();
+        l.resize_grow();
+        let r = l.rects(4, 100, 80);
+        assert_eq!(r[0], Rect { x: 0, y: 0, w: 50, h: 40 });
+        assert_eq!(r[1], Rect { x: 50, y: 0, w: 50, h: 40 });
+    }
+
+    #[test]
+    fn resize_affects_primary_split_only_in_three_window_layout() {
+        let mut l = Layout::default();
+        l.resize_grow();
+        let r = l.rects(3, 100, 80);
+        assert!(r[0].w > 50); // primary column grew
+        // secondary (stacked) column's internal top/bottom split stays 50/50
+        assert_eq!(r[1].h, 40);
+        assert_eq!(r[2].h, 40);
     }
 }

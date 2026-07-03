@@ -84,4 +84,25 @@ else
   fi
 fi
 
+# ── default config ────────────────────────────────────────────────────────────
+# Not required — veil-host runs fine with built-in defaults — but drop a
+# starter config.lua so keybinds/output/background are easy to find and edit.
+# Never overwrites an existing one.
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/veil"
+CONFIG_FILE="${CONFIG_DIR}/config.lua"
+
+if [ -f "$CONFIG_FILE" ]; then
+  info "config.lua already exists at ${CONFIG_FILE}, leaving it alone"
+else
+  bold "Fetching default config.lua..."
+  mkdir -p "$CONFIG_DIR"
+  CONFIG_URL="https://raw.githubusercontent.com/${REPO}/${VERSION}/config.lua"
+  if curl -fsSL -o "$CONFIG_FILE" "$CONFIG_URL" 2>/dev/null || wget -q -O "$CONFIG_FILE" "$CONFIG_URL" 2>/dev/null; then
+    info "installed : ${CONFIG_FILE}"
+  else
+    rm -f "$CONFIG_FILE"
+    info "couldn't fetch config.lua (non-fatal) — veil-host will just use built-in defaults"
+  fi
+fi
+
 green "Done. Run: veil-host probe"

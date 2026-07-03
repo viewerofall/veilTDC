@@ -10,11 +10,20 @@
 //! unusable, we also install a panic hook and fatal-signal handlers that
 //! restore text mode from a stashed fd — a last-resort so a bug never leaves
 //! the machine wedged.
+//!
+//! The same last-resort path also unlinks the Wayland socket
+//! (`$XDG_RUNTIME_DIR/wayland-veil-0`) and `crate::lockfile`'s
+//! `veil-host.lock`, so veil never leaves either behind no matter how it
+//! exits — clean shutdown, HOME, Ctrl-C, or a crash. [`install_handlers`]
+//! must run unconditionally (both output modes), not just from
+//! [`VtGuard::acquire`] — a terminal-mode (crossterm) session has no VT to
+//! take over but still has a socket + lock file to clean up.
 
+use std::ffi::CString;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 // linux/kd.h
 const KDSETMODE: libc::c_ulong = 0x4B3A;
@@ -24,6 +33,30 @@ const KD_GRAPHICS: libc::c_int = 0x01;
 /// Raw fd of the controlling VT, published for the emergency restore path.
 /// -1 means "not in graphics mode / nothing to restore".
 static VT_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Absolute Wayland socket path, set once at startup via [`set_socket_path`]
+/// so [`emergency_restore`] can unlink it from a signal handler (no
+/// allocation there — `CString` is prebuilt, `unlink` is a raw syscall).
+static SOCKET_PATH: OnceLock<CString> = OnceLock::new();
+
+/// Record the bound Wayland socket's absolute path. Call once, early in
+/// `main`, before anything that could crash — first call wins.
+pub fn set_socket_path(absolute_path: &str) {
+    if let Ok(c) = CString::new(absolute_path) {
+        let _ = SOCKET_PATH.set(c);
+    }
+}
+
+/// Same idea as [`SOCKET_PATH`], for `crate::lockfile`'s
+/// `$XDG_RUNTIME_DIR/veil-host.lock` — set by `lockfile::acquire_or_exit`,
+/// never set at all for a `-O` (unregistered) run.
+static LOCK_PATH: OnceLock<CString> = OnceLock::new();
+
+pub fn set_lock_path(absolute_path: &str) {
+    if let Ok(c) = CString::new(absolute_path) {
+        let _ = LOCK_PATH.set(c);
+    }
+}
 
 pub struct VtGuard {
     fd: OwnedFd,
@@ -47,7 +80,7 @@ impl VtGuard {
         }
 
         VT_FD.store(raw, Ordering::SeqCst);
-        install_emergency_handlers();
+        install_handlers();
         eprintln!("[veil-host] VT → graphics mode (fbcon suspended)");
         Ok(VtGuard { fd })
     }
@@ -67,9 +100,13 @@ impl Drop for VtGuard {
     }
 }
 
-/// Restore the VT to text mode immediately, from anywhere (signal handler,
-/// panic hook, explicit shutdown). Idempotent and async-signal-safe enough
-/// for our purposes (single ioctl + tcflush on a stashed fd).
+/// Restore the VT to text mode and unlink the Wayland socket, from anywhere
+/// (signal handler, panic hook, explicit shutdown). Idempotent and
+/// async-signal-safe enough for our purposes (an ioctl + tcflush on a
+/// stashed fd, plus an unlink on a preallocated path — no locks, no
+/// allocation). Every intentional shutdown path (HOME, Ctrl-C/SIGTERM)
+/// already calls this directly; [`install_handlers`] wires it into crashes
+/// too, so this is the single place "veil is going away" funnels through.
 pub fn emergency_restore() {
     let raw = VT_FD.load(Ordering::SeqCst);
     if raw >= 0 {
@@ -78,9 +115,19 @@ pub fn emergency_restore() {
             libc::tcflush(raw, libc::TCIFLUSH);
         }
     }
+    if let Some(path) = SOCKET_PATH.get() {
+        unsafe { libc::unlink(path.as_ptr()); }
+    }
+    if let Some(path) = LOCK_PATH.get() {
+        unsafe { libc::unlink(path.as_ptr()); }
+    }
 }
 
-fn install_emergency_handlers() {
+/// Install the panic hook + fatal-signal handlers. Call unconditionally at
+/// startup (both terminal and DRM output modes) — NOT just from
+/// `VtGuard::acquire`, which only runs in DRM mode but the socket still
+/// needs cleaning up in terminal mode too. Idempotent (`Once`).
+pub fn install_handlers() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // Panic: restore the console, then run the normal hook so the backtrace
