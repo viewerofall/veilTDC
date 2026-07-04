@@ -39,10 +39,13 @@ fn print_help() {
     println!();
     println!("SUBCOMMANDS");
     println!("  run <command> [args...]   Launch a GUI app inside the compositor");
+    println!("  start                     Open an empty compositor straight to the launcher —");
+    println!("                            no command needed, pick something once you're in");
+    println!("  stop                      Stop the running default instance (SIGTERM, graceful)");
     println!("  probe                     Show terminal capabilities and resolved config");
     println!("  list-modes                List all render modes and which one would be chosen");
     println!();
-    println!("RUN FLAGS");
+    println!("RUN / START FLAGS");
     println!("  -a, --append              Add the app to an already-running veil instance");
     println!("                            (launches against its socket; works cross-VT).");
     println!("                            No -s: auto-discovers the socket from the lock");
@@ -69,6 +72,8 @@ fn print_help() {
     println!("  veil-host run -d -m halfblock firefox");
     println!("  veil-host run --stats nautilus");
     println!("  veil-host run -O -s wayland-veil-2 weston-terminal   # second, unregistered instance");
+    println!("  veil-host start                    # empty desktop, launcher open, pick an app");
+    println!("  veil-host stop                     # stop the running default instance");
     println!("  veil-host probe");
     println!("  veil-host list-modes");
     println!();
@@ -83,15 +88,18 @@ fn main() -> std::io::Result<()> {
     let subcmd = raw_args.next().unwrap_or_default();
 
     match subcmd.as_str() {
+        ""                  => { print_help(); return Ok(()); }
         "-v" | "--version"  => { println!("veil-host {VERSION}"); return Ok(()); }
         "--help"            => { print_help(); return Ok(()); }
         "probe"             => return cmd_probe(),
         "list-modes"        => { cmd_list_modes(); return Ok(()); }
-        "run"               => {}
+        "stop"              => return cmd_stop(),
+        "run" | "start"     => {}
         _                   => { eprintln!("unknown subcommand: {subcmd:?}"); eprintln!("run 'veil-host --help' for usage"); std::process::exit(2); }
     }
+    let is_start = subcmd == "start";
 
-    // ── `run` subcommand ──────────────────────────────────────────────────────
+    // ── `run` / `start` subcommand ───────────────────────────────────────────
     let mut cfg        = HostConfig::default();
     let mut debug      = false;
     let mut spawn: Vec<String> = Vec::new();
@@ -123,7 +131,19 @@ fn main() -> std::io::Result<()> {
             cmd => { spawn.push(cmd.to_string()); }
         }
     }
-    if spawn.is_empty() { eprintln!("error: 'run' requires a command\nrun 'veil-host --help' for usage"); std::process::exit(2); }
+    if is_start {
+        if !spawn.is_empty() {
+            eprintln!("error: 'start' takes no command — it opens straight to the launcher (use 'run' to launch a specific app)");
+            std::process::exit(2);
+        }
+        if append {
+            eprintln!("error: -a/--append doesn't apply to 'start' (there's no command to append)");
+            std::process::exit(2);
+        }
+    } else if spawn.is_empty() {
+        eprintln!("error: 'run' requires a command\nrun 'veil-host --help' for usage");
+        std::process::exit(2);
+    }
 
     // --append: don't start a compositor — launch the app against an
     // already-running veil instance's socket and exit. Works cross-VT because
@@ -152,7 +172,7 @@ fn main() -> std::io::Result<()> {
     // above — pass -s explicitly on both ends for an -O instance).
     veil_host::lockfile::acquire_or_exit(&cfg.socket_name, override_lock);
 
-    cfg.spawn = Some(spawn);
+    cfg.spawn = if is_start { None } else { Some(spawn) };
 
     // Load config.lua (see `config_path()`) for keybinds + output pref etc.
     // Falls back to defaults if no config file is found or it fails to parse.
@@ -169,6 +189,21 @@ fn main() -> std::io::Result<()> {
         veil_host::vt::set_socket_path(&format!("{runtime_dir}/{}", cfg.socket_name));
     }
     veil_host::vt::install_handlers();
+
+    // Belt-and-suspenders for the *non*-crash, *non*-signal exit paths: the
+    // Ctrl-C/SIGTERM handler already calls `emergency_restore` eagerly, and
+    // `install_handlers` covers panics/fatal signals — but a `?` bailing out
+    // of this function (e.g. `output.render_frame` erroring) or the frame
+    // loop just `break`ing because the compositor thread ended on its own
+    // (no panic, no signal) skipped cleanup entirely until now, leaving a
+    // dead-PID lock file and a stale socket behind. Drop runs on every one of
+    // those paths; `emergency_restore` is idempotent so double-calling it
+    // (e.g. after the signal handler already ran) is harmless.
+    struct ShutdownGuard;
+    impl Drop for ShutdownGuard {
+        fn drop(&mut self) { veil_host::vt::emergency_restore(); }
+    }
+    let _shutdown_guard = ShutdownGuard;
 
     // ── Debug mode: redirect stderr into the persistent log so it doesn't corrupt output.
     if debug { init_debug_log()?; }
@@ -412,28 +447,78 @@ fn cmd_probe() -> std::io::Result<()> {
     let ssh_mode = std::env::var("SSH_CLIENT").is_ok() || std::env::var("SSH_TTY").is_ok();
     let compositor_mode = wayland != "unset" || display != "unset";
 
+    // Mirrors `output::detect`'s actual precedence — VEIL_OUTPUT > nested
+    // compositor check > config.lua `output` pref > SSH session > try DRM.
+    // Keep this in sync with that function; probe is only useful if it tells
+    // you the truth about what `run` will actually pick.
+    let veil_output_env = std::env::var("VEIL_OUTPUT").ok();
+    let predicted_backend: &str = match veil_output_env.as_deref() {
+        Some("drm") | Some("kms")       => "DRM/KMS (VEIL_OUTPUT forces it)",
+        Some("terminal") | Some("term") => "terminal (VEIL_OUTPUT forces it)",
+        _ if compositor_mode             => "terminal (nested compositor detected)",
+        _ => match vcfg.output {
+            veil_config::OutputPref::Terminal => "terminal (config.lua output=terminal)",
+            veil_config::OutputPref::Drm      => "DRM/KMS (config.lua output=drm, forced)",
+            veil_config::OutputPref::Auto if ssh_mode => "terminal (SSH session)",
+            veil_config::OutputPref::Auto => "DRM/KMS (if available), else terminal",
+        },
+    };
+
     println!("terminal        : {term}");
     println!("colorterm       : {colorterm}");
     println!("term size       : {cols}x{rows} cells");
     println!("compositor      : {comp_w}x{comp_h} px  ({pixel_source})");
     println!("detected quality: {detected:?}");
-    println!("config quality  : {}", format!("{:?}", vcfg.quality));
+    println!("config quality  : {:?}", vcfg.quality);
     println!("fps             : {}", vcfg.fps);
     println!("gpu_render      : {}", if vcfg.gpu_render { "on (default)" } else { "off" });
+    println!("config output   : {:?}", vcfg.output);
+    println!("config mod_key  : {}", vcfg.keybinds.mod_key.label());
+    println!("config bg color : #{:02x}{:02x}{:02x}", vcfg.background[0], vcfg.background[1], vcfg.background[2]);
     println!("config file     : {}", cfg_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (using defaults)".into()));
     println!("WAYLAND_DISPLAY : {wayland}");
     println!("DISPLAY         : {display}");
     println!("SSH_CLIENT      : {}", if ssh_mode { "yes (using terminal output)" } else { "no" });
-    println!("output backend  : {}", if compositor_mode || ssh_mode { "terminal" } else { "DRM/KMS (if available)" });
+    println!("output backend  : {predicted_backend}");
     println!("socket (default): wayland-veil-0");
     Ok(())
+}
+
+/// Stop the registered default instance (the one tracked by the lock file —
+/// see `lockfile.rs`). An `-O` instance isn't registered there and can't be
+/// found this way; `kill` its pid directly.
+fn cmd_stop() -> std::io::Result<()> {
+    let Some(info) = veil_host::lockfile::read_live() else {
+        eprintln!("[veil-host] no running instance found (checked the lock file)");
+        std::process::exit(1);
+    };
+
+    eprintln!("[veil-host] stopping pid {} (socket {:?})...", info.pid, info.socket_name);
+    if unsafe { libc::kill(info.pid, libc::SIGTERM) } != 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("[veil-host] failed to signal pid {}: {e}", info.pid);
+        std::process::exit(1);
+    }
+
+    // SIGTERM triggers the same graceful shutdown path as Ctrl-C (see
+    // `ctrlc_set` below): frame loop exits, socket + lock file are unlinked.
+    // Give it a couple seconds before reporting it as still running.
+    for _ in 0..20 {
+        if unsafe { libc::kill(info.pid, 0) } != 0 {
+            eprintln!("[veil-host] stopped");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("[veil-host] pid {} still alive after 2s — send SIGKILL yourself if it's wedged: kill -9 {}", info.pid, info.pid);
+    std::process::exit(1);
 }
 
 // ─── signal handler ───────────────────────────────────────────────────────────
 
 /// Install a SIGINT handler. The closure must be Send + 'static and is
 /// stashed in a static slot — first call wins, subsequent calls no-op.
-fn ctrlc_set<F: FnMut() + Send + 'static>(mut f: F) -> std::io::Result<()> {
+fn ctrlc_set<F: FnMut() + Send + 'static>(f: F) -> std::io::Result<()> {
     use std::sync::Mutex;
     static HOOK: Mutex<Option<Box<dyn FnMut() + Send>>> = Mutex::new(None);
 
@@ -443,7 +528,7 @@ fn ctrlc_set<F: FnMut() + Send + 'static>(mut f: F) -> std::io::Result<()> {
         }
     }
 
-    *HOOK.lock().unwrap() = Some(Box::new(move || f()));
+    *HOOK.lock().unwrap() = Some(Box::new(f));
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = handler as *const () as usize;

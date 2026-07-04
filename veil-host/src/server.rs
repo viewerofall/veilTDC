@@ -163,6 +163,10 @@ pub struct State {
     pub serial_counter:    u32,
     pub frame_serial:      u64,
     pub running:           bool,
+    /// Same `Arc<AtomicBool>` `run()` was handed for external shutdown
+    /// (Ctrl-C/SIGTERM/`veil-host stop`) — Shift+Alt+E sets it from the
+    /// inside too, same graceful-quit path either direction.
+    pub stop:              Arc<AtomicBool>,
     pub start_time:        Instant,
     pub display_handle:       DisplayHandle,
     pub host_clipboard:       Option<String>,
@@ -989,7 +993,7 @@ fn composite_and_send(state: &mut State, composite_interval: Duration) {
         .collect();
     for s in &surfaces {
         send_frame_callbacks(s, time);
-        for (popup, _) in PopupManager::popups_for_surface(&s) {
+        for (popup, _) in PopupManager::popups_for_surface(s) {
             send_frame_callbacks(popup.wl_surface(), time);
         }
     }
@@ -1015,6 +1019,7 @@ fn draw_help_overlay(state: &State, back: &mut [u8], w: u32, h: u32) {
     lines.push(String::new());
     lines.push(format!("{mod_label}+/  TOGGLE THIS MENU"));
     lines.push(format!("{mod_label}+D  APP LAUNCHER"));
+    lines.push("SHIFT+ALT+E  QUIT (GRACEFUL)".to_string());
 
     let text_cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u32;
     let box_w = text_cols * advance + pad as u32 * 2;
@@ -1194,6 +1199,15 @@ fn apply_input(state: &mut State, cmd: InputCmd) {
                         return FilterResult::Forward;
                     };
 
+                    // Shift+Alt+E: graceful quit. Fixed, not `keybinds.mod_key`
+                    // scaled — same reasoning as Ctrl+C always being Ctrl
+                    // regardless of mod_key: your escape hatch shouldn't move
+                    // just because you remapped the everyday chord.
+                    if mods.shift && mods.alt && ch == 'e' {
+                        st.stop.store(true, Ordering::Relaxed);
+                        return FilterResult::Intercept(());
+                    }
+
                     let mod_held = match st.keybinds.mod_key {
                         veil_config::ModKey::Super => mods.logo,
                         veil_config::ModKey::Ctrl  => mods.ctrl,
@@ -1323,6 +1337,7 @@ pub struct LoopData {
     pub display: Display<State>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     socket_name: &str,
     width:  u32,
@@ -1401,15 +1416,12 @@ pub fn run(
         let mut last = String::new();
         loop {
             std::thread::sleep(Duration::from_millis(1000));
-            match get_contents(ClipboardType::Regular, PasteSeat::Unspecified, MimeType::Text) {
-                Ok((mut reader, _)) => {
-                    let mut text = String::new();
-                    if reader.read_to_string(&mut text).is_ok() && !text.is_empty() && text != last {
-                        last = text.clone();
-                        if clipboard_tx.send(text).is_err() { break; }
-                    }
+            if let Ok((mut reader, _)) = get_contents(ClipboardType::Regular, PasteSeat::Unspecified, MimeType::Text) {
+                let mut text = String::new();
+                if reader.read_to_string(&mut text).is_ok() && !text.is_empty() && text != last {
+                    last = text.clone();
+                    if clipboard_tx.send(text).is_err() { break; }
                 }
-                Err(_) => {}
             }
         }
     });
@@ -1433,7 +1445,9 @@ pub fn run(
         keybinds,
         show_help: false,
         background: [background[0], background[1], background[2], 255],
-        launcher: None,
+        // No anchor client to spawn into (`veil-host start`) → open straight
+        // to the launcher instead of an empty screen with no hint of what to press.
+        launcher: if spawn.is_none() { Some(Launcher::new()) } else { None },
         socket_name: socket_name.to_string(),
         popups:           PopupManager::default(),
         surface_buffers:  HashMap::new(),
@@ -1444,6 +1458,7 @@ pub fn run(
         serial_counter: 0,
         frame_serial:   0,
         running:        true,
+        stop:           stop.clone(),
         start_time:     Instant::now(),
         display_handle:       dh.clone(),
         host_clipboard:       None,
@@ -1458,6 +1473,11 @@ pub fn run(
     let mut event_loop: EventLoop<'static, LoopData> = EventLoop::try_new()
         .map_err(|e| io::Error::other(format!("event_loop: {e}")))?;
     let handle = event_loop.handle();
+    // Grabbed so the stop checks below can actually end `event_loop.run()` —
+    // `calloop::EventLoop::run` only returns once this is told to stop; the
+    // `stop`/`data.state.running` checks alone don't do that on their own,
+    // they just decide whether to call it.
+    let loop_signal = event_loop.get_signal();
 
     // 1. Wayland listening socket → accept clients.
     let listener_source = ListeningSocketSource::with_name(socket_name)
@@ -1515,6 +1535,7 @@ pub fn run(
     //    flush clients, check stop flag. 8 ms tick = ~120 Hz ceiling.
     let socket_name_owned = socket_name.to_string();
     let stop_t = stop.clone();
+    let loop_signal_t = loop_signal.clone();
     let tick = Timer::immediate();
     handle.insert_source(tick, move |_, _, data| {
         // Prune toplevels that the client has destroyed. If any closed, retile
@@ -1586,6 +1607,7 @@ pub fn run(
         let _ = data.display.flush_clients();
 
         if stop_t.load(Ordering::Relaxed) || !data.state.running {
+            loop_signal_t.stop();
             TimeoutAction::Drop
         } else {
             TimeoutAction::ToDuration(Duration::from_millis(8))
@@ -1634,6 +1656,7 @@ pub fn run(
         let _ = data.display.flush_clients();
         if stop.load(Ordering::Relaxed) || !data.state.running {
             data.state.running = false;
+            loop_signal.stop();
         }
     }).map_err(|e| io::Error::other(format!("run: {e}")))?;
 

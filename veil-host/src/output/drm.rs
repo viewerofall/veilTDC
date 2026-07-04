@@ -61,6 +61,7 @@ impl CardSetup {
             fbs: self.fbs,
             back: 1,
             flip_pending: false,
+            was_active: true,
             _vt: vt,
         }
     }
@@ -97,6 +98,11 @@ pub struct DrmOutput {
     back:         usize,
     /// A page-flip is queued; its completion event hasn't been drained yet.
     flip_pending: bool,
+    /// Seat activity as of the last `render_frame` call, to detect the
+    /// disable→enable edge (VT switched back to us) and re-assert our CRTC —
+    /// whatever grabbed the VT in between (fbcon, another compositor) has its
+    /// own idea of what that CRTC should be scanning out.
+    was_active:   bool,
     /// VT held in graphics mode. Declared LAST so it drops last: our `Drop`
     /// destroys buffers, then `card` drops (releasing DRM-master), then this
     /// restores text mode — handing a clean console back to fbcon / the
@@ -264,7 +270,34 @@ impl OutputBackend for DrmOutput {
             }
         }
 
-        if !self.seat.is_active() {
+        let active_now = self.seat.is_active();
+        if active_now && !self.was_active {
+            // Coming back from a VT switch: whatever had the display in
+            // between left the CRTC in an unknown state, and any flip we had
+            // in flight before switching away is never going to complete —
+            // its fence belonged to the old CRTC config. Re-assert our mode
+            // before touching page_flip again, or it'll EINVAL and (since
+            // that error propagates out of the frame loop) take the whole
+            // compositor down with it.
+            self.flip_pending = false;
+            match self.on_vt_switch(true) {
+                // Only clear the resume flag once the re-modeset actually
+                // lands — a transient failure (e.g. the outgoing session
+                // hasn't released the CRTC yet) retries every frame instead
+                // of wedging silently until the next VT-switch cycle.
+                Ok(()) => self.was_active = true,
+                Err(e) => eprintln!("[veil-host] VT resume: re-modeset failed, retrying: {e}"),
+            }
+        } else {
+            self.was_active = active_now;
+        }
+
+        if !active_now {
+            return Ok(());
+        }
+        if !self.was_active {
+            // Re-modeset still hasn't landed — don't attempt to flip against
+            // a CRTC we don't trust yet.
             return Ok(());
         }
 
@@ -288,7 +321,10 @@ impl OutputBackend for DrmOutput {
                 }
                 // EBUSY: previous flip not retired yet — drop this frame.
                 Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-                Err(e) => return Err(e),
+                // Anything else (e.g. a stale CRTC state we didn't catch):
+                // drop the frame rather than taking the whole compositor
+                // down over one bad flip.
+                Err(e) => eprintln!("[veil-host] page_flip failed: {e}"),
             }
         }
         Ok(())

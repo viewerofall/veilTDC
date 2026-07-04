@@ -87,7 +87,7 @@ impl GpuEncoder {
                 &wgpu::ComputePassDescriptor { label: Some("hb"), timestamp_writes: None });
             pass.set_pipeline(&self.hb_pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((cols as u32 + 7) / 8, (rows as u32 + 7) / 8, 1);
+            pass.dispatch_workgroups((cols as u32).div_ceil(8), (rows as u32).div_ceil(8), 1);
         }
         enc.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, bytes);
         self.queue.submit([enc.finish()]);
@@ -139,7 +139,7 @@ impl GpuEncoder {
                 &wgpu::ComputePassDescriptor { label: Some("luma"), timestamp_writes: None });
             pass.set_pipeline(&self.luma_pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups((cols as u32 + 7) / 8, (rows as u32 + 7) / 8, 1);
+            pass.dispatch_workgroups((cols as u32).div_ceil(8), (rows as u32).div_ceil(8), 1);
         }
         enc.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, bytes);
         self.queue.submit([enc.finish()]);

@@ -132,12 +132,15 @@ veil-host run -w 1920 -h 1080 thunar     # explicit compositor resolution
 veil-host run -s wayland-veil-1 thunar   # custom socket name
 veil-host run -O -s wayland-veil-2 xterm # second, unregistered instance (bypasses the lock)
 
+# Stop the running default instance from anywhere (graceful, SIGTERM)
+veil-host stop
+
 # Probe terminal capabilities and resolved config
 veil-host probe
 veil-host list-modes
 ```
 
-Press `Ctrl+C`, or use the configured `close` keybind on the last window, to exit — veil-host shuts down cleanly and wipes its socket and lock file no matter how it exits (normal quit, signal, or crash).
+Press `Ctrl+C`, hit `Shift+Alt+E` in the compositor, or run `veil-host stop` from another terminal/VT — all three shut down cleanly and wipe the socket and lock file. `Shift+Alt+E` is the one guaranteed to work in DRM/bare-TTY mode: it's a compositor keybind, not a terminal signal, so it doesn't depend on the tty's line discipline generating SIGINT (which bare-TTY evdev-grab mode may not do).
 
 ### Single instance / lock file
 
@@ -172,7 +175,7 @@ Set in `config.lua`'s `keybinds` table (see below) — held modifier + a single 
 | Grow / shrink primary pane | `=` / `-` |
 | Help overlay | `/` |
 | App launcher | `d` |
-| Quit | `Ctrl+C` (always `Ctrl`, independent of `mod_key`) |
+| Quit (graceful) | `Shift+Alt+E`, fixed — or `Ctrl+C` / `veil-host stop` from outside |
 
 > In terminal mode (nested under a WM), use `mod_key = "alt"` or `"ctrl"` — terminals never forward the Super/Logo key, the WM eats it first. `"super"` only works in bare-TTY (DRM/evdev) mode.
 

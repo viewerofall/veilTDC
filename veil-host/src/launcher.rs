@@ -26,6 +26,12 @@ pub struct Launcher {
     entries:      Vec<DesktopEntry>,
 }
 
+impl Default for Launcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Launcher {
     pub fn new() -> Self {
         Self { query: String::new(), selected: 0, entries: scan_desktop_entries() }

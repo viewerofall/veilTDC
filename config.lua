@@ -38,3 +38,9 @@ keybinds = {
 }
 -- Help overlay: <mod_key>+/ (e.g. Alt+/ above) always toggles a keybind
 -- cheat-sheet — hardcoded, not itself a config entry.
+--
+-- Shift+Alt+E: graceful quit — fixed, not scaled to mod_key (same reasoning
+-- as Ctrl+C below: your escape hatch shouldn't move when you remap the
+-- everyday chord). Works in both terminal and DRM/bare-TTY mode; Ctrl+C
+-- relies on the tty's line discipline generating SIGINT, which bare-TTY
+-- evdev-grab mode may not deliver the same way.

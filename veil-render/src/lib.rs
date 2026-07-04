@@ -93,7 +93,7 @@ pub fn compute_luma(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: u16) -
         .collect()
 }
 
-pub fn apply_hysteresis(stable: &mut Vec<u8>, current: &[u8], threshold: u8) -> bool {
+pub fn apply_hysteresis(stable: &mut [u8], current: &[u8], threshold: u8) -> bool {
     let mut changed = false;
     for (s, &c) in stable.iter_mut().zip(current.iter()) {
         if (*s as i16 - c as i16).abs() >= threshold as i16 {
@@ -132,9 +132,9 @@ pub fn luma_to_chars(luma: &[u8], cols: u16, rows: u16) -> Vec<char> {
             let l = get(row, col);
 
             // Horizontal contrast (left→right) → indicates a vertical edge `|`
-            let horiz = (get(row, col - 1) as i16 - get(row, col + 1) as i16).abs() as u8;
+            let horiz = (get(row, col - 1) as i16 - get(row, col + 1) as i16).unsigned_abs() as u8;
             // Vertical contrast (above→below) → indicates a horizontal edge `-`
-            let vert  = (get(row - 1, col) as i16 - get(row + 1, col) as i16).abs() as u8;
+            let vert  = (get(row - 1, col) as i16 - get(row + 1, col) as i16).unsigned_abs() as u8;
 
             let ch = if horiz > EDGE_T && vert > EDGE_T {
                 '+'
@@ -255,7 +255,7 @@ pub fn render_kitty_frame(rgba: &[u8], src_w: u32, src_h: u32, cols: u16, rows: 
 
 fn base64_encode(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {
         let b0 = c[0] as u32;
         let b1 = c.get(1).copied().unwrap_or(0) as u32;

@@ -120,6 +120,7 @@ impl InputBackend for EvdevInput {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     tx: &std::sync::mpsc::Sender<InputCmd>,
     ev: evdev::InputEvent,

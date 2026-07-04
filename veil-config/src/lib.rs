@@ -12,7 +12,7 @@ pub enum Quality {
 }
 
 impl Quality {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_str(s: &str) -> Self {
         match s {
             "auto"       => Self::Auto,
             "pixel"      => Self::Pixel,
@@ -295,7 +295,7 @@ pub fn load(path: &Path) -> VeilConfig {
 
     VeilConfig {
         quality: gl.get::<String>("quality")
-            .map(|s| Quality::from_str(&s))
+            .map(|s| Quality::parse_str(&s))
             .unwrap_or(d.quality),
         fps: gl.get::<u32>("fps")
             .unwrap_or(d.fps),

@@ -66,6 +66,7 @@ pub const GLYPH_H: u32 = 7;
 
 /// Stamp one glyph into an RGBA buffer at `(x, y)`, `scale`x pixel-doubled,
 /// in `color`. Out-of-bounds pixels are clipped.
+#[allow(clippy::too_many_arguments)]
 fn draw_char(back: &mut [u8], w: u32, h: u32, x: i32, y: i32, scale: u32, c: char, color: [u8; 4]) {
     let rows = glyph_rows(c);
     for (row, bits) in rows.iter().enumerate() {
@@ -89,6 +90,7 @@ fn draw_char(back: &mut [u8], w: u32, h: u32, x: i32, y: i32, scale: u32, c: cha
 }
 
 /// Stamp a left-aligned text string. Returns the pixel width consumed.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text(back: &mut [u8], w: u32, h: u32, x: i32, y: i32, scale: u32, text: &str, color: [u8; 4]) -> u32 {
     let advance = (GLYPH_W + 1) * scale;
     for (i, c) in text.chars().enumerate() {
@@ -99,6 +101,7 @@ pub fn draw_text(back: &mut [u8], w: u32, h: u32, x: i32, y: i32, scale: u32, te
 
 /// Fill an axis-aligned rect with a flat color (used for the help box
 /// background). Clips to the buffer extent.
+#[allow(clippy::too_many_arguments)]
 pub fn fill_rect(back: &mut [u8], w: u32, h: u32, x: i32, y: i32, rw: u32, rh: u32, color: [u8; 4]) {
     for row in 0..rh as i32 {
         let py = y + row;
