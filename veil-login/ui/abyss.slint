@@ -1,0 +1,736 @@
+// Abyss login manager — Slint UI.
+//
+// Palette (deep sage): bg #0b100c, accent #9db08a, secondary #b7c9a3.
+// Flow: clock screen → (click) → username → (enter) → password → login.
+// A remembered user skips straight from the clock to the password field.
+// Runs fullscreen on the linuxkms backend; sized window under winit for dev.
+
+// ── flat action button (power / reboot / keyboard toggle) ──────────────────
+component IconButton inherits Rectangle {
+    in property <string> label;
+    callback clicked;
+
+    width: 48px;
+    height: 48px;
+    border-radius: 14px;
+    background: ta.has-hover ? #9db08a22 : transparent;
+    border-width: 1px;
+    border-color: ta.has-hover ? #9db08a88 : #9db08a33;
+    animate background, border-color { duration: 120ms; }
+
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.label;
+        color: ta.has-hover ? #9db08a : #9db08a99;
+        font-size: 19px;
+        animate color { duration: 120ms; }
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── themed rounded text field ───────────────────────────────────────────────
+component ThemedInput inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text;
+    in property <bool> password: false;
+    property <bool> reveal: false;
+    callback accepted();
+    callback edited(string);
+    callback focus-gained();
+
+    public function focus-input() { ti.focus(); }
+
+    height: 44px;
+    border-radius: 12px;
+    background: #18211a;
+    border-width: 1px;
+    border-color: ti.has-focus ? #9db08a : #9db08a33;
+    animate border-color { duration: 150ms; }
+    clip: true;
+
+    ti := TextInput {
+        x: 16px;
+        width: parent.width - 32px - (root.password ? 28px : 0px);
+        height: parent.height;
+        vertical-alignment: center;
+        color: root.password && !root.reveal ? transparent : #e4e9dd;
+        font-size: 15px;
+        font-family: "Inconsolata";
+        single-line: true;
+        input-type: InputType.text;
+        text <=> root.text;
+        accepted => { root.accepted(); }
+        edited => { root.edited(self.text); }
+        changed has-focus => {
+            if (self.has-focus) { root.focus-gained(); }
+        }
+    }
+
+    Text {
+        x: 16px;
+        height: 100%;
+        vertical-alignment: center;
+        text: root.placeholder;
+        color: #e4e9dd55;
+        font-size: 15px;
+        font-family: "Inconsolata";
+        visible: root.text == "";
+    }
+
+    // masked view — little orbs standing in for each typed character
+    // (character-count is bound through a plain property first — using the
+    // builtin call directly as a repeater's model expression trips a rustc
+    // parenthesization bug in Slint 1.17's generated code.)
+    property <int> mask-len: root.text.character-count;
+    if root.password && !root.reveal : Rectangle {
+        x: 16px;
+        width: parent.width - 32px - 28px;
+        height: parent.height;
+        clip: true;
+        for i in root.mask-len : Rectangle {
+            x: i * 14px;
+            y: (parent.height - self.height) / 2;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: #9db08a;
+        }
+    }
+
+    // light sweep — beams across when the eye toggles reveal on/off
+    Rectangle {
+        x: root.reveal ? parent.width + 30px : -60px;
+        y: 0px;
+        width: 60px;
+        height: parent.height;
+        background: @linear-gradient(90deg,
+            transparent 0%, #e4e9dd66 42%, #ffffffdd 50%, #e4e9dd66 58%, transparent 100%);
+        animate x { duration: 420ms; easing: cubic-bezier(0.3, 0, 0.2, 1); }
+    }
+
+    if root.password : TouchArea {
+        x: parent.width - 30px;
+        width: 28px;
+        height: parent.height;
+        clicked => { root.reveal = !root.reveal; }
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: root.reveal ? "🙈" : "👁";
+            font-size: 14px;
+        }
+    }
+
+    TouchArea {
+        width: parent.width - (root.password ? 28px : 0px);
+        clicked => { ti.focus(); }
+    }
+}
+
+// ── virtual keyboard key ────────────────────────────────────────────────────
+component VkKey inherits Rectangle {
+    in property <string> label;
+    in property <length> key-width: 52px;
+    callback pressed;
+
+    width: root.key-width;
+    height: 46px;
+    border-radius: 10px;
+    background: ta.pressed ? #9db08a55 : (ta.has-hover ? #9db08a22 : #18211a);
+    border-width: 1px;
+    border-color: ta.pressed ? #9db08a : #9db08a2a;
+    animate background { duration: 80ms; }
+
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.label;
+        color: #e4e9dd;
+        font-size: 17px;
+        font-family: "Inconsolata";
+    }
+
+    ta := TouchArea {
+        clicked => { root.pressed(); }
+    }
+}
+
+export component LoginWindow inherits Window {
+    title: "Abyss";
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    background: #0b100c;
+
+    // ── state from Rust ─────────────────────────────────────────────────────
+    in-out property <string> username;
+    in-out property <string> password;
+    in property <[string]> sessions: ["Veil"];
+    in-out property <int> session-index: 0;
+    in property <string> error-msg;
+    in property <bool> busy: false;
+    in property <image> avatar;
+    in property <bool> has-avatar: false;
+    in property <string> user-initial: "?";
+    in property <image> wallpaper;
+    in property <bool> has-wallpaper: false;
+    in property <string> hostname: "void";
+    in property <string> clock-time: "--:--:--";
+    in property <string> clock-date: "";
+    in property <int> cooldown-secs: 0;
+    in property <int> tty-target: 4;
+    in-out property <length> shake-offset: 0px;
+    // true when the username was restored from last-user — hides the
+    // username field and puts the cursor straight into the password.
+    in-out property <bool> user-known: false;
+
+    // ── callbacks into Rust ─────────────────────────────────────────────────
+    callback login(string, string, int);       // username, password, session idx
+    callback poweroff();
+    callback reboot();
+    callback to-tty();                         // switch to a text VT (tty4)
+    callback username-edited(string);          // live — reloads avatar
+    callback vk-key(int, string);              // field (0=user,1=pass), char
+    callback vk-backspace(int);
+
+    // ── local state ─────────────────────────────────────────────────────────
+    property <int> stage: 0;                   // 0 = clock, 1 = login
+    property <int> confirm-action: 0;          // 0 none, 1 poweroff, 2 reboot, 3 tty
+    property <bool> pass-visible: false;
+    property <int> active-field: 0;            // last-focused field for the VK
+    property <bool> vk-visible: false;
+    property <bool> vk-shift: false;
+
+    property <[[string]]> vk-lower: [
+        ["1","2","3","4","5","6","7","8","9","0","-"],
+        ["q","w","e","r","t","y","u","i","o","p"],
+        ["a","s","d","f","g","h","j","k","l"],
+        ["z","x","c","v","b","n","m",".","_"],
+    ];
+    property <[[string]]> vk-upper: [
+        ["!","@","#","$","%","^","&","*","(",")","+"],
+        ["Q","W","E","R","T","Y","U","I","O","P"],
+        ["A","S","D","F","G","H","J","K","L"],
+        ["Z","X","C","V","B","N","M",",","~"],
+    ];
+    property <[[string]]> vk-rows: root.vk-shift ? root.vk-upper : root.vk-lower;
+
+    function do-login() {
+        if (!root.busy && root.cooldown-secs <= 0 && root.username != "") {
+            root.login(root.username, root.password, root.session-index);
+        }
+    }
+
+    function enter-login() {
+        if (root.stage != 0) { return; }
+        root.stage = 1;
+        if (root.username != "") {
+            root.pass-visible = true;
+            pass-input.focus-input();
+        } else {
+            user-input.focus-input();
+        }
+    }
+
+    function show-password() {
+        if (root.username != "") {
+            root.pass-visible = true;
+            pass-input.focus-input();
+        }
+    }
+
+    // ── background ──────────────────────────────────────────────────────────
+    if root.has-wallpaper : Image {
+        source: root.wallpaper;
+        width: 100%;
+        height: 100%;
+        image-fit: cover;
+    }
+    if !root.has-wallpaper : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: @linear-gradient(160deg, #0b100c 0%, #16211a 55%, #0b100c 100%);
+    }
+    // dim veil over the wallpaper so the card always reads
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #0b100c;
+        opacity: root.has-wallpaper ? 0.45 : 0;
+    }
+
+    // ── hostname corner ─────────────────────────────────────────────────────
+    Text {
+        x: 28px;
+        y: 22px;
+        text: root.hostname;
+        color: #b7c9a3aa;
+        font-size: 15px;
+        font-family: "Syne";
+        letter-spacing: 2px;
+    }
+
+    // ── veil wordmark, top center — fills the dead space above the clock ────
+    Text {
+        x: (parent.width - self.width) / 2;
+        y: 64px;
+        text: "v e i l";
+        color: #9db08a3a;
+        font-size: 14px;
+        font-family: "Syne";
+        letter-spacing: 6px;
+        opacity: root.stage == 0 ? 1 : 0;
+        animate opacity { duration: 350ms; }
+    }
+
+    // ── login card (under the clock layer; fades in at stage 1) ─────────────
+    card := Rectangle {
+        width: 380px;
+        height: self.preferred-height;
+        x: (parent.width - self.width) / 2 + root.shake-offset;
+        y: (parent.height - self.height) / 2
+            - (root.vk-visible ? 120px : 0px)
+            + (root.stage == 1 ? 0px : 26px);
+        animate x { duration: 70ms; easing: ease-in-out; }
+        border-radius: 22px;
+        background: #121a14e6;
+        border-width: 1px;
+        border-color: #9db08a44;
+        drop-shadow-blur: 32px;
+        drop-shadow-color: #000000aa;
+        opacity: root.stage == 1 ? 1 : 0;
+        animate opacity { duration: 400ms; easing: ease-out; }
+        animate y { duration: 400ms; easing: ease-out; }
+
+        VerticalLayout {
+            padding: 28px;
+            spacing: 12px;
+            alignment: start;
+
+            // avatar — click it to switch user when the name is remembered
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 92px;
+                    height: 92px;
+                    border-radius: 46px;
+                    clip: true;
+                    background: #18211a;
+                    border-width: 2px;
+                    border-color: #9db08a;
+
+                    if root.has-avatar : Image {
+                        source: root.avatar;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: cover;
+                    }
+                    if !root.has-avatar : Text {
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: root.user-initial;
+                        color: #9db08a;
+                        font-size: 38px;
+                        font-family: "Syne";
+                    }
+
+                    TouchArea {
+                        clicked => {
+                            root.user-known = false;
+                            user-input.focus-input();
+                        }
+                    }
+                }
+            }
+
+            Text {
+                text: root.username == "" ? "who goes there" : root.username;
+                color: #e4e9dd;
+                font-size: 19px;
+                font-family: "Syne";
+                horizontal-alignment: center;
+            }
+            if root.user-known : Text {
+                text: "not you? tap the picture";
+                color: #9db08a66;
+                font-size: 11px;
+                font-family: "Inconsolata";
+                horizontal-alignment: center;
+            }
+
+            // username — collapsed entirely for a remembered user
+            user-input := ThemedInput {
+                placeholder: "username";
+                text <=> root.username;
+                height: root.user-known ? 0px : 44px;
+                opacity: root.user-known ? 0 : 1;
+                animate height, opacity { duration: 300ms; easing: ease-out; }
+                edited(t) => { root.username-edited(t); }
+                accepted => { root.show-password(); }
+                focus-gained => { root.active-field = 0; }
+            }
+
+            // password — slides open once the username is in
+            pass-input := ThemedInput {
+                placeholder: "password";
+                text <=> root.password;
+                password: true;
+                height: root.pass-visible ? 44px : 0px;
+                opacity: root.pass-visible ? 1 : 0;
+                animate height, opacity { duration: 300ms; easing: ease-out; }
+                accepted => { root.do-login(); }
+                focus-gained => { root.active-field = 1; }
+            }
+
+            // session picker  ‹ Veil ›
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+                height: 34px;
+
+                Rectangle {
+                    width: 30px;
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: "‹";
+                        color: #b7c9a3;
+                        font-size: 22px;
+                    }
+                    TouchArea {
+                        clicked => {
+                            root.session-index =
+                                root.session-index == 0
+                                    ? root.sessions.length - 1
+                                    : root.session-index - 1;
+                        }
+                    }
+                }
+                Text {
+                    text: root.sessions[root.session-index];
+                    color: #b7c9a3;
+                    font-size: 15px;
+                    font-family: "Inconsolata";
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                    min-width: 140px;
+                }
+                Rectangle {
+                    width: 30px;
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: "›";
+                        color: #b7c9a3;
+                        font-size: 22px;
+                    }
+                    TouchArea {
+                        clicked => {
+                            root.session-index =
+                                root.session-index >= root.sessions.length - 1
+                                    ? 0
+                                    : root.session-index + 1;
+                        }
+                    }
+                }
+            }
+
+            // login button
+            login-btn := Rectangle {
+                height: 44px;
+                border-radius: 12px;
+                background: lta.has-hover && !root.busy && root.cooldown-secs <= 0 ? #9db08a : #9db08acc;
+                opacity: root.busy || root.cooldown-secs > 0 ? 0.5 : 1;
+                animate background, opacity { duration: 120ms; }
+
+                Text {
+                    width: 100%;
+                    height: 100%;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    text: root.cooldown-secs > 0 ? "try again in \{root.cooldown-secs}s"
+                        : root.busy ? "authenticating…" : "login";
+                    color: #0b100c;
+                    font-size: 16px;
+                    font-family: "Syne";
+                }
+                lta := TouchArea {
+                    enabled: root.cooldown-secs <= 0;
+                    clicked => {
+                        if (!root.pass-visible) {
+                            root.show-password();
+                        } else {
+                            root.do-login();
+                        }
+                    }
+                }
+            }
+
+            // error line
+            Text {
+                text: root.error-msg;
+                color: #d08770;
+                font-size: 13px;
+                font-family: "Inconsolata";
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                opacity: root.error-msg == "" || root.cooldown-secs > 0 ? 0 : 1;
+                animate opacity { duration: 200ms; }
+            }
+        }
+    }
+
+    // ── clock layer (on top at stage 0; click anywhere to open login) ───────
+    clock-layer := Rectangle {
+        width: 100%;
+        height: 100%;
+        opacity: root.stage == 0 ? 1 : 0;
+        animate opacity { duration: 350ms; easing: ease-out; }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 10px;
+            y: root.stage == 0 ? 0px : -40px;
+            animate y { duration: 350ms; easing: ease-out; }
+
+            Text {
+                text: root.clock-time;
+                color: #e4e9dd;
+                font-size: 92px;
+                font-family: "Syne";
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.clock-date;
+                color: #9db08a;
+                font-size: 20px;
+                font-family: "Inconsolata";
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "click or press any key to log in";
+                color: #9db08a66;
+                font-size: 13px;
+                font-family: "Inconsolata";
+                horizontal-alignment: center;
+            }
+        }
+
+        if root.stage == 0 : TouchArea {
+            clicked => { root.enter-login(); }
+        }
+
+        // any key press also opens the login card — grabs focus as soon as
+        // the clock is shown since nothing else on stage 0 is focusable.
+        if root.stage == 0 : FocusScope {
+            init => { self.focus(); }
+            key-pressed(event) => {
+                root.enter-login();
+                accept
+            }
+        }
+    }
+
+    // ── bottom-left: virtual keyboard toggle ────────────────────────────────
+    IconButton {
+        x: 24px;
+        y: parent.height - self.height - 24px;
+        label: "⌨";
+        clicked => { root.vk-visible = !root.vk-visible; }
+    }
+
+    // ── bottom-right: tty + reboot + power (all confirm first) ──────────────
+    IconButton {
+        x: parent.width - self.width * 3 - 48px;
+        y: parent.height - self.height - 24px;
+        label: ">_";
+        clicked => { root.confirm-action = 3; }
+    }
+    IconButton {
+        x: parent.width - self.width * 2 - 36px;
+        y: parent.height - self.height - 24px;
+        label: "↻";
+        clicked => { root.confirm-action = 2; }
+    }
+    IconButton {
+        x: parent.width - self.width - 24px;
+        y: parent.height - self.height - 24px;
+        label: "⏻";
+        clicked => { root.confirm-action = 1; }
+    }
+
+    // ── virtual keyboard ────────────────────────────────────────────────────
+    if root.vk-visible : Rectangle {
+        width: min(720px, parent.width - 32px);
+        height: vk-layout.preferred-height + 24px;
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 16px;
+        border-radius: 18px;
+        background: #121a14f2;
+        border-width: 1px;
+        border-color: #9db08a44;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000aa;
+
+        vk-layout := VerticalLayout {
+            padding: 12px;
+            spacing: 6px;
+
+            for row in root.vk-rows : HorizontalLayout {
+                spacing: 6px;
+                alignment: center;
+                for key in row : VkKey {
+                    label: key;
+                    pressed => { root.vk-key(root.active-field, key); }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: center;
+
+                VkKey {
+                    label: "⇧";
+                    key-width: 70px;
+                    border-color: root.vk-shift ? #b7c9a3 : #9db08a2a;
+                    pressed => { root.vk-shift = !root.vk-shift; }
+                }
+                VkKey {
+                    label: "space";
+                    key-width: 280px;
+                    pressed => { root.vk-key(root.active-field, " "); }
+                }
+                VkKey {
+                    label: "⌫";
+                    key-width: 70px;
+                    pressed => { root.vk-backspace(root.active-field); }
+                }
+                VkKey {
+                    label: "↵";
+                    key-width: 70px;
+                    border-color: #b7c9a366;
+                    pressed => {
+                        if (root.active-field == 0) {
+                            root.show-password();
+                        } else {
+                            root.do-login();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── confirm overlay (topmost) ───────────────────────────────────────────
+    if root.confirm-action != 0 : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #0b100cbb;
+
+        // backdrop click cancels
+        TouchArea {
+            clicked => { root.confirm-action = 0; }
+        }
+
+        Rectangle {
+            width: 320px;
+            height: confirm-layout.preferred-height + 48px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 18px;
+            background: #121a14;
+            border-width: 1px;
+            border-color: #9db08a55;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #000000cc;
+
+            // swallow clicks so the backdrop-cancel doesn't fire through
+            TouchArea { }
+
+            confirm-layout := VerticalLayout {
+                padding: 24px;
+                spacing: 18px;
+
+                Text {
+                    text: root.confirm-action == 1 ? "power off?"
+                        : root.confirm-action == 2 ? "reboot?"
+                        : "switch to tty\{root.tty-target}?";
+                    color: #e4e9dd;
+                    font-size: 19px;
+                    font-family: "Syne";
+                    horizontal-alignment: center;
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+
+                    Rectangle {
+                        height: 42px;
+                        border-radius: 12px;
+                        background: cancel-ta.has-hover ? #18211a : transparent;
+                        border-width: 1px;
+                        border-color: #9db08a44;
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            text: "cancel";
+                            color: #9db08a;
+                            font-size: 14px;
+                            font-family: "Inconsolata";
+                        }
+                        cancel-ta := TouchArea {
+                            clicked => { root.confirm-action = 0; }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 42px;
+                        border-radius: 12px;
+                        background: yes-ta.has-hover ? #9db08a : #9db08acc;
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            text: root.confirm-action == 1 ? "power off"
+                                : root.confirm-action == 2 ? "reboot"
+                                : "go";
+                            color: #0b100c;
+                            font-size: 14px;
+                            font-family: "Syne";
+                        }
+                        yes-ta := TouchArea {
+                            clicked => {
+                                if (root.confirm-action == 1) {
+                                    root.poweroff();
+                                } else if (root.confirm-action == 2) {
+                                    root.reboot();
+                                } else {
+                                    root.to-tty();
+                                }
+                                root.confirm-action = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

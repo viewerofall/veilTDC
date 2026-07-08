@@ -1,0 +1,29 @@
+[package]
+name    = "veil-login"
+version = "0.1.0"
+edition = "2021"
+
+# Abyss — graphical TTY login manager for the Veil/Void ecosystem.
+# Slint UI on DRM/KMS (no X11/Wayland needed), PAM auth, session spawn.
+
+[[bin]]
+name = "velogin"
+path = "src/main.rs"
+
+[dependencies]
+slint = { version = "1.17", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",        # nested dev/testing inside a compositor
+    "backend-linuxkms",     # bare-TTY DRM/KMS via libseat
+    "renderer-femtovg",     # GPU (EGL/GBM) — 6600 XT and most desktops
+    "renderer-software",    # fallback for weak/embedded hardware
+] }
+pam-client2 = "0.5"
+image       = { workspace = true }
+uzers       = "0.12"
+thiserror   = "2"
+libc        = { workspace = true }
+
+[build-dependencies]
+slint-build = "1.17"
