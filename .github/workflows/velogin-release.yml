@@ -1,0 +1,50 @@
+name: Velogin Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. velogin-v0.1.0)"
+        required: true
+      title:
+        description: "Release title"
+        required: true
+permissions:
+  contents: write
+jobs:
+  build-package:
+    name: Build and package velogin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev pkg-config build-essential
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build velogin
+        run: cargo build --release -p veil-login --bin velogin
+      - name: Stage release bundle
+        run: |
+          set -eu
+          rm -rf release
+          mkdir -p release/velogin/dist/pam.d
+          cp target/release/velogin release/velogin/velogin
+          cp veil-login/dist/velogin.service release/velogin/dist/velogin.service
+          cp veil-login/dist/pam.d/velogin release/velogin/dist/pam.d/velogin
+          cp veil-login/dist/install.sh release/velogin/install.sh
+          chmod 755 release/velogin/velogin release/velogin/install.sh
+      - name: Create velogin tarball
+        run: |
+          set -eu
+          cd release
+          tar -czf velogin.tar.gz velogin
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: velogin-release-artifact
+          path: release/velogin.tar.gz
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: ${{ github.event.inputs.title }}
+          files: release/velogin.tar.gz
