@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev libdrm-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libinput-dev libudev-dev libwayland-dev pkg-config build-essential
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev libdrm-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libinput-dev libpam0g-dev libudev-dev libwayland-dev pkg-config build-essential
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build
@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev libdrm-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libinput-dev libudev-dev libwayland-dev pkg-config build-essential
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev libdrm-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libinput-dev libpam0g-dev libudev-dev libwayland-dev pkg-config build-essential
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build

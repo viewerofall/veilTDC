@@ -2,12 +2,17 @@ name: Velogin Release
 on:
   workflow_dispatch:
     inputs:
+      append_to_latest:
+        description: "Append velogin.tar.gz to the latest existing release"
+        type: boolean
+        required: true
+        default: false
       version:
-        description: "Version tag (e.g. velogin-v0.1.0)"
-        required: true
+        description: "Version tag when not appending to latest"
+        required: false
       title:
-        description: "Release title"
-        required: true
+        description: "Release title when not appending to latest"
+        required: false
 permissions:
   contents: write
 jobs:
@@ -17,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev libdrm-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libinput-dev libudev-dev libwayland-dev pkg-config build-essential
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libseat-dev libgbm-dev libdrm-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libinput-dev libpam0g-dev libudev-dev libwayland-dev pkg-config build-essential
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build velogin
@@ -42,9 +47,33 @@ jobs:
         with:
           name: velogin-release-artifact
           path: release/velogin.tar.gz
+      - name: Resolve release target
+        id: release_target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPEND_TO_LATEST: ${{ github.event.inputs.append_to_latest }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_TITLE: ${{ github.event.inputs.title }}
+        run: |
+          set -eu
+          if [ "$APPEND_TO_LATEST" = "true" ]; then
+            tag_name="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q '.tagName')"
+            release_name="$(gh release view --repo "$GITHUB_REPOSITORY" --json name -q '.name')"
+          else
+            if [ -z "$INPUT_VERSION" ] || [ -z "$INPUT_TITLE" ]; then
+              echo "version and title are required when append_to_latest is false" >&2
+              exit 1
+            fi
+            tag_name="$INPUT_VERSION"
+            release_name="$INPUT_TITLE"
+          fi
+          {
+            echo "tag_name=$tag_name"
+            echo "release_name=$release_name"
+          } >> "$GITHUB_OUTPUT"
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version }}
-          name: ${{ github.event.inputs.title }}
+          tag_name: ${{ steps.release_target.outputs.tag_name }}
+          name: ${{ steps.release_target.outputs.release_name }}
           files: release/velogin.tar.gz
