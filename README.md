@@ -93,6 +93,40 @@ INSTALL_DIR=~/.local/bin curl -fsSL .../install.sh | bash
 VERSION=v0.1.0 curl -fsSL .../install.sh | bash
 ```
 
+### Velogin
+
+Install the login manager directly from the repo script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/viewerofall/veilTDC/main/veil-login/dist/install.sh | sudo bash
+```
+
+or with wget:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/viewerofall/veilTDC/main/veil-login/dist/install.sh | sudo bash
+```
+
+By default this downloads `velogin.tar.gz` from the latest GitHub release, installs:
+
+- `/usr/local/bin/velogin`
+- `/etc/pam.d/velogin`
+- `/etc/systemd/system/velogin.service`
+
+You can pin a release tag:
+
+```bash
+VERSION=v1.2.0 curl -fsSL https://raw.githubusercontent.com/viewerofall/veilTDC/main/veil-login/dist/install.sh | sudo bash
+```
+
+After install:
+
+```bash
+sudo systemctl enable --now seatd.service
+sudo systemctl disable getty@tty1.service
+sudo systemctl enable velogin.service
+```
+
 ### From source
 
 Requirements: Rust stable. Runs nested under any Wayland/X11 compositor (Niri, Hyprland, etc.), or standalone on a bare TTY with a real GPU (DRM/KMS + `libseat`).
